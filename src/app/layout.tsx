@@ -63,6 +63,10 @@ export const metadata: Metadata = {
     follow: true,
     googleBot: { index: true, follow: true, "max-image-preview": "large" },
   },
+  verification: {
+    // Google Search Console ownership proof (URL-prefix property)
+    google: "-OqhOAtj5Lq0DFIhoa39K1JzsyhI9RC_pZyd2JlVXVg",
+  },
 };
 
 /* Structured data: site + full tool list (helps Google build sitelinks) */
