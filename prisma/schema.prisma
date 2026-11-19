@@ -39,6 +39,17 @@ model ToolUsage {
   updatedAt DateTime @updatedAt
 }
 
+model ToolUsageDay {
+  id        String   @id @default(cuid())
+  day       String // YYYY-MM-DD (UTC)
+  tool      String
+  count     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([day, tool])
+}
+
 model PageView {
   id        String   @id @default(cuid())
   day       String   @unique // YYYY-MM-DD (UTC)

@@ -7,8 +7,11 @@
  *  2. Transcribe the bassline to semitone notes and shift the WHOLE line
  *     by one global octave so its median centers on the user's target
  *     band. A global shift preserves every interval exactly — the sub
- *     plays the same melody, note for note, just deeper. Frame data is
- *     applied at the CENTER of each analysis window (see
+ *     plays the same melody, note for note, just deeper. Two modes:
+ *     "calm" follows every note (floor-clamped so nothing sinks below
+ *     the band), "extreme" locks onto the bassline's DOMINANT note per
+ *     section — a steady in-band sub at full pressure, zero bouncing.
+ *     Frame data is applied at the CENTER of each analysis window (see
  *     BassAnalysis.centerOffsetSec) plus a note-confirmation delay
  *     (~1.5 hops): a straddling window can lock onto a new note's attack
  *     up to ~100 ms before the note truly starts, which made the sub
@@ -19,10 +22,13 @@
  *     the sub band, so the track never plays two bass lines at once.
  *  4. Synthesize the new sub: constant per-note frequency with a short
  *     portamento glide between notes, plus a per-sample attack/release
- *     envelope scaled to the sub period. An anti-collision guard never
- *     leaves a sub note in unison with an original note that survives
- *     the removal filter — two sines at the same pitch drift in and out
- *     of phase, which is the classic "two basses wobbling" artefact.
+ *     envelope scaled to the sub period. A line-level anti-collision
+ *     guard never leaves the sub's core in unison with original notes
+ *     that survive the removal filter — two sines at the same pitch
+ *     drift in and out of phase, the classic "two basses wobbling"
+ *     artefact. The guard shifts the WHOLE line one octave when needed
+ *     (a single consistent move — the old per-note guard made
+ *     individual notes leap octaves and the sub audibly bounced).
  *     "Survives" is measured slope-aware: an N dB/oct high-pass leaves
  *     a note below its corner only N·log2(corner/f) dB down, so notes
  *     several semitones below the cutoff still count as audible when
@@ -49,6 +55,7 @@ import { analyzeBass, type BassAnalysis } from "./pitch";
 
 export type RebassWaveform = "sine" | "saturated" | "triangle";
 export type RebassFollow = "slow" | "natural" | "fast";
+export type RebassMode = "extreme" | "calm";
 
 export interface RebassOptions {
   /** target band, e.g. 29–34 Hz */
@@ -67,6 +74,13 @@ export interface RebassOptions {
   subLevelDb: number;
   waveform: RebassWaveform;
   follow: RebassFollow;
+  /**
+   * "extreme": the sub locks onto the bassline's dominant note per
+   * section — a steady, saturated sub that stays inside the band and
+   * hits at full pressure (the stress-your-speakers rebass).
+   * "calm": the sub follows the bassline note for note, gently.
+   */
+  mode: RebassMode;
 }
 
 export interface RebassInfo {
@@ -213,12 +227,18 @@ export interface BasslineMap {
  * per-note "closest octave" zigzag (which turned a 2-semitone step into a
  * 10-semitone leap and sounded like a second, unrelated bass line).
  *
- * Anti-collision guard: a sub note is never left in unison with an
- * original note that survives the removal high-pass. Two sines at the
- * same pitch but different phase drift in and out of phase — the
- * "two bass frequencies modulating each other" wobble. Colliding notes
- * drop one more octave (octave-related originals collapsing onto the
- * same sub pitch is normal rebass behaviour).
+ * Line-level anti-collision guard: if the line's median note would land
+ * in unison with an original note that survives the removal high-pass,
+ * the WHOLE line shifts one more octave down — one consistent move, no
+ * per-note leaps. Two sines at the same pitch but different phase drift
+ * in and out of phase — the "two bass frequencies modulating each other"
+ * wobble. (Octave-related originals collapsing onto the same sub pitch
+ * is normal rebass behaviour and does not beat.)
+ *
+ * Never below the band: every mapped frequency is held at or above
+ * rangeLow (calm) or clamped into the band (extreme), so a 29–34 Hz
+ * setting never turns into a 20 Hz rumble small speakers can't even
+ * reproduce.
  */
 export function mapBasslineNotes(
   analysis: BassAnalysis,
@@ -227,7 +247,9 @@ export function mapBasslineNotes(
   /** resolved removal cutoff in Hz — originals near/above it survive */
   cutoffHz: number,
   /** removal filter steepness in dB/oct — decides how far below the cutoff a note is still audible */
-  removeSlopeDb: number
+  removeSlopeDb: number,
+  /** extreme: dominant-note sub locked inside the band; calm: melodic */
+  mode: RebassMode
 ): BasslineMap {
   const frames = analysis.frames;
   const fc = Math.sqrt(low * high);
@@ -322,31 +344,94 @@ export function mapBasslineNotes(
     if (noteToHz(n) >= surviveThresh) surviving.add(n);
   }
 
-  // map with the collision guard: drop an octave while the candidate sub
-  // pitch coincides with a surviving original note (for k = 0 that is the
-  // note's own original — the worst case, exact unison)
-  const mapNote = (note: number): number => {
-    let k = kStar;
-    while (k < 6) {
-      if (!surviving.has(note - 12 * k)) break;
-      k++;
-    }
-    return Math.max(16, noteToHz(note - 12 * k));
-  };
+  // Line-level anti-collision guard: if the line's MEDIAN note still
+  // lands in unison with a surviving original at this octave shift (a
+  // manual cutoff that doesn't clear the line, or a bassline that
+  // already sits inside the band), drop the whole line one more octave.
+  // One consistent shift for every note — the previous per-note guard
+  // moved individual colliding notes up octaves while their neighbours
+  // stayed put, and the sub audibly "bounced" up and down through those
+  // sections.
+  const medNote = snapToNote(med);
+  let kLine = kStar;
+  while (kLine < 5 && surviving.has(medNote - 12 * kLine)) kLine++;
+  kStar = kLine;
 
   const targets = new Float32Array(frames);
-  let lastNote: number | null = null;
   let minHz = Infinity;
   let maxHz = 0;
-  for (const r of runs) {
-    const runNote = r.len >= 2 ? r.note : lastNote;
-    if (runNote !== null) {
-      const hz = mapNote(runNote);
-      for (let f = r.start; f < r.end; f++) targets[f] = hz;
-      if (r.len >= 2) {
-        lastNote = r.note;
+
+  if (mode === "extreme") {
+    /* Dominant-note sub: the median of the snapped notes in a ±1 s
+     * window per frame, then a debounced switch (the new dominant must
+     * hold ~0.4 s before the pitch moves). The sub sits on one steady
+     * pitch per section, always inside the band, and pumps with the
+     * track's own bass envelope — maximum pressure, and by design it
+     * cannot bounce up and down octaves. */
+    const W = Math.max(5, Math.round(1.0 / analysis.hopSec));
+    const HOLD = Math.max(3, Math.round(0.4 / analysis.hopSec));
+    const dom = new Int32Array(frames).fill(NO_NOTE);
+    const vals: number[] = [];
+    for (let i = 0; i < frames; i++) {
+      vals.length = 0;
+      for (let j = Math.max(0, i - W); j <= Math.min(frames - 1, i + W); j++) {
+        if (noteIdx[j] !== NO_NOTE) vals.push(noteIdx[j]);
+      }
+      if (vals.length >= 3) {
+        vals.sort((a, b) => a - b);
+        dom[i] = vals[Math.floor(vals.length / 2)];
+      }
+    }
+    // debounce: hold the current pitch until a different dominant note
+    // has persisted for HOLD frames (≈0.4 s)
+    let cur = NO_NOTE;
+    let cand = NO_NOTE;
+    let hold = 0;
+    for (let i = 0; i < frames; i++) {
+      const d = dom[i];
+      if (cur === NO_NOTE && d !== NO_NOTE) {
+        cur = d;
+      } else if (d !== NO_NOTE && d !== cur) {
+        if (d === cand) {
+          hold++;
+          if (hold >= HOLD) {
+            cur = d;
+            cand = NO_NOTE;
+            hold = 0;
+          }
+        } else {
+          cand = d;
+          hold = 1;
+        }
+      } else if (d === cur) {
+        cand = NO_NOTE;
+        hold = 0;
+      }
+      if (cur !== NO_NOTE) {
+        const hz = Math.min(high, Math.max(low, noteToHz(cur - 12 * kStar)));
+        targets[i] = hz;
         if (hz < minHz) minHz = hz;
         if (hz > maxHz) maxHz = hz;
+      }
+    }
+  } else {
+    /* Calm melodic mapping: run-by-run targets like before, but every
+     * note is held at or above the band floor. Notes that used to map
+     * to 16–25 Hz (inaudible on almost any speaker, and the reason a
+     * "29–34 Hz" rebass sounded like 20 Hz or less) now sit AT the
+     * floor instead of sinking under it — no octave-fold jumps, just a
+     * gentle floor. */
+    let lastNote: number | null = null;
+    for (const r of runs) {
+      const runNote = r.len >= 2 ? r.note : lastNote;
+      if (runNote !== null) {
+        const hz = Math.max(low, noteToHz(runNote - 12 * kStar));
+        for (let f = r.start; f < r.end; f++) targets[f] = hz;
+        if (r.len >= 2) {
+          lastNote = r.note;
+          if (hz < minHz) minHz = hz;
+          if (hz > maxHz) maxHz = hz;
+        }
       }
     }
   }
@@ -419,7 +504,8 @@ export async function processRebass(
     low,
     high,
     cutoffHz,
-    opts.removeSlope
+    opts.removeSlope,
+    opts.mode
   );
 
   // per-frame amplitude target (0..1), normalized so p95 of active = 1.
@@ -654,9 +740,10 @@ export function rebassDefaults(): RebassOptions {
     rangeHigh: 34,
     removeBelowHz: "auto",
     removeSlope: 48,
-    subLevelDb: 0,
-    waveform: "sine",
-    follow: "natural",
+    subLevelDb: 6,
+    waveform: "saturated",
+    follow: "fast",
+    mode: "extreme",
   };
 }
 

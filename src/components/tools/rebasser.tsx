@@ -25,6 +25,7 @@ import {
   type RebassOptions,
   type RebassWaveform,
   type RebassFollow,
+  type RebassMode,
 } from "@/lib/audio/rebass";
 import { formatDb, formatHz } from "@/lib/audio/engine";
 
@@ -52,10 +53,12 @@ export default function RebasserTool() {
     suggestion ? suggestion.high : 34
   );
   const [slope, setSlope] = useState<12 | 24 | 36 | 48>(48);
-  const [subLevel, setSubLevel] = useState(0);
-  const [waveform, setWaveform] = useState<RebassWaveform>("sine");
-  const [follow, setFollow] = useState<RebassFollow>("natural");
+  const [subLevel, setSubLevel] = useState(6);
+  const [waveform, setWaveform] = useState<RebassWaveform>("saturated");
+  const [follow, setFollow] = useState<RebassFollow>("fast");
+  const [mode, setMode] = useState<RebassMode>("extreme");
   const [activePreset, setActivePreset] = useState<string | undefined>();
+  const [activeCharPreset, setActiveCharPreset] = useState<string>("Extreme Raw");
 
   const info = proc.result?.info;
 
@@ -76,8 +79,9 @@ export default function RebasserTool() {
       subLevelDb: subLevel,
       waveform,
       follow,
+      mode,
     };
-  }, [range, autoRemove, manualRemoveBelow, slope, subLevel, waveform, follow]);
+  }, [range, autoRemove, manualRemoveBelow, slope, subLevel, waveform, follow, mode]);
 
   const apply = useCallback(
     (opts: RebassOptions) => {
@@ -157,8 +161,44 @@ export default function RebasserTool() {
     },
   ];
 
+  const characterPresets = [
+    {
+      label: "Extreme Raw",
+      apply: () => {
+        setMode("extreme");
+        setWaveform("saturated");
+        setSubLevel(6);
+        setFollow("fast");
+        setSlope(48);
+        setActiveCharPreset("Extreme Raw");
+      },
+    },
+    {
+      label: "Calm",
+      apply: () => {
+        setMode("calm");
+        setWaveform("sine");
+        setSubLevel(-2);
+        setFollow("natural");
+        setActiveCharPreset("Calm");
+      },
+    },
+  ];
+
   return (
     <ToolPage toolId="rebasser">
+      <div className="mb-6">
+        <InfoBanner>
+          <strong>Still being forged.</strong> The Rebasser listens to your
+          track and re-synthesizes its low end from scratch — our most
+          advanced tool, and it keeps improving. On tricky material (dense
+          mixes, live recordings, detuned basses) a note can land oddly or
+          the sub can sit sparse. If something sounds off, switch between
+          <strong> Extreme</strong> and <strong>Calm</strong>, adjust the
+          removal cutoff, or nudge the target band. The rest of your track
+          is never modified.
+        </InfoBanner>
+      </div>
       <ToolGrid>
         <div className="flex flex-col gap-6">
           <ControlsCard
@@ -187,6 +227,17 @@ export default function RebasserTool() {
               </div>
             </div>
             <PresetChips presets={presets} active={activePreset} />
+          </ControlsCard>
+
+          <ControlsCard
+            title="Rebass character"
+            description={
+              mode === "extreme"
+                ? "Extreme Raw: the sub locks onto your bassline's core note and stays inside the band — full pressure, steady, made to stress sound systems. Best with the Saturated character."
+                : "Calm: the sub follows your bassline note for note, gently — every interval preserved, nothing below the band floor."
+            }
+          >
+            <PresetChips presets={characterPresets} active={activeCharPreset} />
           </ControlsCard>
 
           <ControlsCard
@@ -327,9 +378,10 @@ export default function RebasserTool() {
             <InfoBanner>
               <strong>How it works:</strong> the current low end is filtered
               out, then a brand-new sub-bass line is synthesized inside your
-              chosen band (29–34 Hz? 45–60? totally up to you). The sub
-              plays your song's own bassline, note for note, shifted into
-              the band.
+              chosen band (29–34 Hz? 45–60? totally up to you).
+              <strong> Extreme Raw</strong> pins a saturated sub to the
+              bassline's core note — loud, steady, relentless.
+              <strong> Calm</strong> lets a pure sine follow every note.
             </InfoBanner>
           )}
           {proc.result ? (

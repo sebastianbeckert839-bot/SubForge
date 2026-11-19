@@ -45,10 +45,13 @@ export function ToolPage({
   toolId,
   children,
   wide = false,
+  standalone = false,
 }: {
   toolId: string;
   children: ReactNode;
   wide?: boolean;
+  /** true for tools that generate audio and don't need an uploaded file */
+  standalone?: boolean;
 }) {
   const tool = getTool(toolId);
   const { channels, meta, clear } = useAudioStore();
@@ -115,6 +118,8 @@ export function ToolPage({
           </div>
           {children}
         </>
+      ) : standalone ? (
+        children
       ) : (
         <div className="mx-auto max-w-2xl">
           <FileDrop />

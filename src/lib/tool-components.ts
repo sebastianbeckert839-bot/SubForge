@@ -28,6 +28,7 @@ const loaders: Record<string, Promise<{ default: ComponentType }>> = {
   "silence-remover": import("@/components/tools/silence-remover"),
   "channel-converter": import("@/components/tools/channel-converter"),
   "spectrum-analyzer": import("@/components/tools/spectrum-analyzer"),
+  "frequency-generator": import("@/components/tools/frequency-generator"),
   visualizer: import("@/components/tools/visualizer"),
 };
 

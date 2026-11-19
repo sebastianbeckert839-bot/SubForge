@@ -248,6 +248,16 @@ export const TOOLS: ToolMeta[] = [
     suffix: "spectrum",
   },
   {
+    id: "frequency-generator",
+    name: "Frequency Generator",
+    tagline: "Test tones & sweeps from 20 Hz to 20 kHz",
+    description:
+      "Generate pure sine, square, triangle or sawtooth tones at any frequency, or sweep across the whole spectrum. Perfect for testing speakers and subs, finding rattles and resonances, or picking your rebass band.",
+    category: "analysis",
+    icon: "WaveSquare",
+    suffix: "tone",
+  },
+  {
     id: "visualizer",
     name: "Video Visualizer",
     tagline: "Turn any track into a 1080p60 video",

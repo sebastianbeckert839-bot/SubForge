@@ -23,7 +23,7 @@ export const metadata: Metadata = {
     template: "%s | SubForge",
   },
   description:
-    "SubForge is the free online rebasser: strip a song's original bass and forge a new sub-bass line in any custom frequency band (like 29–34 Hz), following the track's own bassline. Plus a smooth +15 dB bass booster, slowed + reverb, nightcore, 8D audio, vocal remover, visualizer video maker and 15 more audio tools — all in your browser, no uploads, no sign-up.",
+    "SubForge is the free online rebasser: strip a song's original bass and forge a new sub-bass line in any custom frequency band (like 29–34 Hz), following the track's own bassline. Plus a smooth +15 dB bass booster, slowed + reverb, nightcore, 8D audio, vocal remover, frequency generator, visualizer video maker and 15 more audio tools — all in your browser, no uploads, no sign-up.",
   keywords: [
     "online rebasser",
     "rebass a song",
@@ -47,7 +47,7 @@ export const metadata: Metadata = {
   openGraph: {
     title: "SubForge — Online Rebasser & Free Audio Tools",
     description:
-      "Rebass any song into a custom sub band, boost bass +15 dB distortion-free, make slowed + reverb edits, and render 1080p60 visualizer videos. 22 free tools, all local in your browser.",
+      "Rebass any song into a custom sub band, boost bass +15 dB distortion-free, make slowed + reverb edits, and render 1080p60 visualizer videos. 23 free tools, all local in your browser.",
     siteName: "SubForge",
     type: "website",
     url: "/",
