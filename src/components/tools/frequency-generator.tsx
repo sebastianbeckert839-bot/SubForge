@@ -1,11 +1,10 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
-import { toast } from "sonner";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
-import { AudioWaveform } from "lucide-react";
+import { Pause, Play } from "lucide-react";
 import {
   ToolPage,
   ToolGrid,
@@ -15,17 +14,11 @@ import {
   PresetChips,
   InfoBanner,
 } from "@/components/tool-ui";
-import { ABPlayer } from "@/components/ab-player";
-import { DownloadPanel } from "@/components/download-panel";
-import type { Channels } from "@/lib/audio/dsp";
 
-const FS = 44100;
 const F_MIN = 20;
 const F_MAX = 20000;
 
 type ToneWave = "sine" | "square" | "triangle" | "sawtooth";
-type GenMode = "fixed" | "sweep";
-type SweepCurve = "log" | "linear";
 
 /** slider position (0..1000) ↔ Hz on a log scale */
 const posToHz = (pos: number) =>
@@ -34,159 +27,139 @@ const hzToPos = (hz: number) =>
   (1000 * Math.log(hz / F_MIN)) / Math.log(F_MAX / F_MIN);
 
 function formatFreq(hz: number): string {
-  return hz >= 1000 ? `${(hz / 1000).toFixed(hz >= 10000 ? 1 : 2)} kHz` : `${Math.round(hz)} Hz`;
+  return hz >= 1000
+    ? `${(hz / 1000).toFixed(hz >= 10000 ? 1 : 2)} kHz`
+    : `${Math.round(hz)} Hz`;
 }
 
-function waveSample(phase: number, kind: ToneWave): number {
-  switch (kind) {
-    case "sine":
-      return Math.sin(phase);
-    case "square":
-      return Math.sin(phase) >= 0 ? 1 : -1;
-    case "triangle":
-      return (2 / Math.PI) * Math.asin(Math.sin(phase));
-    case "sawtooth": {
-      // phase in [0, 2π) → −1..1 ramp
-      const t = phase / (2 * Math.PI);
-      return 2 * t - 1;
-    }
-  }
+/** nearest musical note + detune in cents (A4 = 440 Hz) */
+const NOTE_NAMES = [
+  "A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#",
+];
+function noteName(hz: number): string {
+  if (!Number.isFinite(hz) || hz <= 0) return "—";
+  const exact = 12 * Math.log2(hz / 440);
+  const n = Math.round(exact);
+  const name = NOTE_NAMES[((n % 12) + 12) % 12];
+  const octave = 4 + Math.floor((n + 9) / 12);
+  const cents = Math.round((exact - n) * 100);
+  if (cents === 0) return `${name}${octave} · in tune`;
+  return `${name}${octave} · ${cents > 0 ? "+" : "−"}${Math.abs(cents)} ¢`;
 }
 
-function dbToGain(db: number): number {
-  return Math.pow(10, db / 20);
-}
+/** volume % → linear gain (quadratic curve keeps the low end of the slider usable) */
+const volToGain = (v: number) => Math.pow(v / 100, 2) * 0.9;
 
-function generateTone(opts: {
-  mode: GenMode;
-  wave: ToneWave;
-  freq: number;
-  sweepStart: number;
-  sweepEnd: number;
-  durationSec: number;
-  levelDb: number;
-  fadeMs: number;
-  curve: SweepCurve;
-}): Channels {
-  const N = Math.max(1, Math.round(opts.durationSec * FS));
-  const left = new Float32Array(N);
-  const right = new Float32Array(N);
-  const amp = dbToGain(opts.levelDb);
-  const fade = Math.max(0.001, opts.fadeMs / 1000);
-  let phase = 0;
-
-  for (let n = 0; n < N; n++) {
-    const t = n / FS;
-    let f: number;
-    if (opts.mode === "fixed") {
-      f = opts.freq;
-    } else {
-      const p = Math.min(1, t / opts.durationSec);
-      f =
-        opts.curve === "log"
-          ? opts.sweepStart *
-            Math.pow(opts.sweepEnd / opts.sweepStart, p)
-          : opts.sweepStart + (opts.sweepEnd - opts.sweepStart) * p;
-    }
-    phase += (2 * Math.PI * f) / FS;
-    if (phase >= 2 * Math.PI) phase -= 2 * Math.PI;
-
-    // click-free fade in/out
-    const env = Math.min(1, t / fade, (opts.durationSec - t) / fade);
-    const s = waveSample(phase, opts.wave) * amp * Math.max(0, env);
-    left[n] = s;
-    right[n] = s;
-  }
-  return [left, right];
+interface LiveTone {
+  ctx: AudioContext;
+  osc: OscillatorNode;
+  gain: GainNode;
 }
 
 export default function FrequencyGeneratorTool() {
-  const [mode, setMode] = useState<GenMode>("fixed");
   const [wave, setWave] = useState<ToneWave>("sine");
   const [freqPos, setFreqPos] = useState(hzToPos(440));
-  const [startPos, setStartPos] = useState(hzToPos(20));
-  const [endPos, setEndPos] = useState(hzToPos(20000));
-  const [duration, setDuration] = useState(10);
-  const [levelDb, setLevelDb] = useState(-6);
-  const [fadeMs, setFadeMs] = useState(20);
-  const [curve, setCurve] = useState<SweepCurve>("log");
-  const [result, setResult] = useState<Channels | null>(null);
+  const [volume, setVolume] = useState(35);
+  const [playing, setPlaying] = useState(false);
   const [activePreset, setActivePreset] = useState<string | undefined>();
 
+  const toneRef = useRef<LiveTone | null>(null);
   const freq = useMemo(() => posToHz(freqPos), [freqPos]);
-  const sweepStart = useMemo(() => posToHz(startPos), [startPos]);
-  const sweepEnd = useMemo(() => posToHz(endPos), [endPos]);
 
-  const generate = useCallback(() => {
-    const chs = generateTone({
-      mode,
-      wave,
-      freq,
-      sweepStart,
-      sweepEnd,
-      durationSec: duration,
-      levelDb,
-      fadeMs,
-      curve,
-    });
-    setResult(chs);
+  /* -------- live oscillator (plays until stopped — no duration) -------- */
+
+  const startTone = () => {
+    if (toneRef.current) return;
+    const ctx = new AudioContext();
+    void ctx.resume();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = wave;
+    osc.frequency.value = freq;
+    gain.gain.value = 0;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    // short fade-in so the tone never clicks
+    gain.gain.setTargetAtTime(volToGain(volume), ctx.currentTime, 0.015);
+    toneRef.current = { ctx, osc, gain };
+    setPlaying(true);
     // count it in the site stats (same endpoint the other tools use)
     void fetch("/api/track", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ tool: "frequency-generator" }),
     }).catch(() => {});
-    toast.success(
-      mode === "fixed"
-        ? `Generated ${formatFreq(freq)} tone`
-        : `Generated ${formatFreq(sweepStart)} → ${formatFreq(sweepEnd)} sweep`
+  };
+
+  const stopTone = () => {
+    const t = toneRef.current;
+    if (!t) return;
+    toneRef.current = null;
+    setPlaying(false);
+    t.gain.gain.setTargetAtTime(0, t.ctx.currentTime, 0.015);
+    window.setTimeout(
+      () => {
+        try {
+          t.osc.stop();
+        } catch {
+          /* already stopped */
+        }
+        void t.ctx.close();
+      },
+      120
     );
-  }, [mode, wave, freq, sweepStart, sweepEnd, duration, levelDb, fadeMs, curve]);
+  };
+
+  // live parameter updates while the tone is sounding
+  useEffect(() => {
+    const t = toneRef.current;
+    if (t) t.osc.frequency.setTargetAtTime(freq, t.ctx.currentTime, 0.008);
+  }, [freq]);
+  useEffect(() => {
+    const t = toneRef.current;
+    if (t) t.osc.type = wave;
+  }, [wave]);
+  useEffect(() => {
+    const t = toneRef.current;
+    if (t)
+      t.gain.gain.setTargetAtTime(volToGain(volume), t.ctx.currentTime, 0.02);
+  }, [volume]);
+
+  // never leave an oscillator running after leaving the page
+  useEffect(
+    () => () => {
+      const t = toneRef.current;
+      if (t) {
+        try {
+          t.osc.stop();
+        } catch {
+          /* already stopped */
+        }
+        void t.ctx.close();
+      }
+    },
+    []
+  );
+
+  /* ------------------------------ presets ------------------------------ */
 
   const presets = [
-    {
-      label: "Sub test 30 Hz",
-      apply: () => {
-        setMode("fixed");
-        setWave("sine");
-        setFreqPos(hzToPos(30));
-        setDuration(10);
-        setActivePreset("Sub test 30 Hz");
-      },
+    { label: "30 Hz", hz: 30 },
+    { label: "40 Hz", hz: 40 },
+    { label: "50 Hz", hz: 50 },
+    { label: "60 Hz", hz: 60 },
+    { label: "440 Hz", hz: 440 },
+    { label: "1 kHz", hz: 1000 },
+  ].map((p) => ({
+    label: p.label,
+    apply: () => {
+      setFreqPos(hzToPos(p.hz));
+      setActivePreset(p.label);
     },
-    {
-      label: "Sub sweep 20–60 Hz",
-      apply: () => {
-        setMode("sweep");
-        setWave("sine");
-        setStartPos(hzToPos(20));
-        setEndPos(hzToPos(60));
-        setDuration(15);
-        setActivePreset("Sub sweep 20–60 Hz");
-      },
-    },
-    {
-      label: "Full sweep 20 Hz–20 kHz",
-      apply: () => {
-        setMode("sweep");
-        setWave("sine");
-        setStartPos(hzToPos(20));
-        setEndPos(hzToPos(20000));
-        setDuration(30);
-        setActivePreset("Full sweep 20 Hz–20 kHz");
-      },
-    },
-    {
-      label: "A4 440 Hz",
-      apply: () => {
-        setMode("fixed");
-        setWave("sine");
-        setFreqPos(hzToPos(440));
-        setDuration(5);
-        setActivePreset("A4 440 Hz");
-      },
-    },
-  ];
+  }));
+
+  /* ------------------------------- render ------------------------------ */
 
   return (
     <ToolPage toolId="frequency-generator" standalone>
@@ -194,17 +167,58 @@ export default function FrequencyGeneratorTool() {
         <div className="flex flex-col gap-6">
           <ControlsCard
             title="Tone"
-            description="Pure test tones generated in your browser at studio quality — 44.1 kHz, click-free."
+            description="A live test tone that plays until you stop it. Drag the frequency slider while it sounds — the pitch follows your finger in real time."
           >
-            <SelectRow
-              label="Mode"
-              value={mode}
-              options={[
-                { value: "fixed", label: "Fixed tone — one steady frequency" },
-                { value: "sweep", label: "Sweep — glide from A to B" },
-              ]}
-              onChange={(v) => setMode(v as GenMode)}
-            />
+            <div className="flex flex-col gap-3">
+              <div className="flex items-end justify-between gap-3">
+                <div>
+                  <label className="text-sm font-medium" htmlFor="fg-freq">
+                    Frequency
+                  </label>
+                  <p className="mt-0.5 font-mono text-xs text-muted-foreground">
+                    {noteName(freq)}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="fg-freq"
+                    className="h-8 w-28 text-right font-mono text-sm tabular-nums"
+                    type="number"
+                    min={F_MIN}
+                    max={F_MAX}
+                    step={1}
+                    value={Math.round(freq)}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      if (Number.isFinite(v)) {
+                        const clamped = Math.min(F_MAX, Math.max(F_MIN, v));
+                        setFreqPos(hzToPos(clamped));
+                        setActivePreset(undefined);
+                      }
+                    }}
+                    aria-label="Frequency in hertz"
+                  />
+                  <span className="text-sm text-muted-foreground">Hz</span>
+                </div>
+              </div>
+              <Slider
+                value={[freqPos]}
+                onValueChange={(v) => {
+                  setFreqPos(v[0]);
+                  setActivePreset(undefined);
+                }}
+                min={0}
+                max={1000}
+                step={1}
+                aria-label="Frequency (logarithmic)"
+              />
+              <div className="flex justify-between font-mono text-[10px] text-muted-foreground/60">
+                <span>20 Hz</span>
+                <span>200 Hz</span>
+                <span>2 kHz</span>
+                <span>20 kHz</span>
+              </div>
+            </div>
             <SelectRow
               label="Waveform"
               value={wave}
@@ -216,151 +230,68 @@ export default function FrequencyGeneratorTool() {
               ]}
               onChange={(v) => setWave(v as ToneWave)}
             />
-            {mode === "fixed" ? (
-              <div className="flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <label className="text-sm font-medium">Frequency</label>
-                  <div className="flex items-center gap-2">
-                    <Input
-                      className="h-8 w-28 text-right font-mono text-sm tabular-nums"
-                      type="number"
-                      min={F_MIN}
-                      max={F_MAX}
-                      step={1}
-                      value={Math.round(freq)}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        if (Number.isFinite(v) && v >= F_MIN && v <= F_MAX) {
-                          setFreqPos(hzToPos(v));
-                        }
-                      }}
-                      aria-label="Frequency in hertz"
-                    />
-                    <span className="text-sm text-muted-foreground">Hz</span>
-                  </div>
-                </div>
-                <Slider
-                  value={[freqPos]}
-                  onValueChange={(v) => setFreqPos(v[0])}
-                  min={0}
-                  max={1000}
-                  step={1}
-                  aria-label="Frequency (logarithmic)"
-                />
-                <div className="flex justify-between font-mono text-[10px] text-muted-foreground/60">
-                  <span>20 Hz</span>
-                  <span>200 Hz</span>
-                  <span>2 kHz</span>
-                  <span>20 kHz</span>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col gap-4">
-                <div className="flex flex-col gap-3">
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm font-medium">Start frequency</label>
-                    <span className="rounded-md bg-muted px-2.5 py-1 font-mono text-sm font-semibold tabular-nums text-primary">
-                      {formatFreq(sweepStart)}
-                    </span>
-                  </div>
-                  <Slider
-                    value={[startPos]}
-                    onValueChange={(v) => setStartPos(v[0])}
-                    min={0}
-                    max={1000}
-                    step={1}
-                    aria-label="Sweep start frequency"
-                  />
-                </div>
-                <div className="flex flex-col gap-3">
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm font-medium">End frequency</label>
-                    <span className="rounded-md bg-muted px-2.5 py-1 font-mono text-sm font-semibold tabular-nums text-primary">
-                      {formatFreq(sweepEnd)}
-                    </span>
-                  </div>
-                  <Slider
-                    value={[endPos]}
-                    onValueChange={(v) => setEndPos(v[0])}
-                    min={0}
-                    max={1000}
-                    step={1}
-                    aria-label="Sweep end frequency"
-                  />
-                </div>
-                <SelectRow
-                  label="Sweep curve"
-                  value={curve}
-                  options={[
-                    { value: "log", label: "Logarithmic — even note spacing (recommended)" },
-                    { value: "linear", label: "Linear — even Hz spacing" },
-                  ]}
-                  onChange={(v) => setCurve(v as SweepCurve)}
-                />
-              </div>
-            )}
             <SliderRow
-              label="Duration"
-              value={duration}
-              min={1}
-              max={120}
-              step={1}
-              onChange={(v) => setDuration(Math.round(v))}
-              format={(v) => `${Math.round(v)} s`}
-            />
-            <SliderRow
-              label="Level"
-              value={levelDb}
-              min={-24}
-              max={0}
-              step={0.5}
-              onChange={(v) => setLevelDb(Math.round(v * 2) / 2)}
-              format={(v) => `${v.toFixed(1)} dBFS`}
-              hint="Start low — pure tones stress speakers fast"
-            />
-            <SliderRow
-              label="Fade in / out"
-              value={fadeMs}
+              label="Volume"
+              value={volume}
               min={0}
-              max={500}
-              step={5}
-              onChange={(v) => setFadeMs(Math.round(v))}
-              format={(v) => `${Math.round(v)} ms`}
-              hint="Prevents clicks at start and end"
+              max={100}
+              step={1}
+              onChange={(v) => setVolume(Math.round(v))}
+              format={(v) => `${Math.round(v)}%`}
+              hint="Ears and speakers first — pure tones at full volume hurt both"
             />
             <PresetChips presets={presets} active={activePreset} />
-            <Button onClick={generate} className="w-full">
-              <AudioWaveform className="size-4" />
-              Generate tone
+            <Button
+              onClick={playing ? stopTone : startTone}
+              variant={playing ? "destructive" : "default"}
+              className="w-full"
+              aria-pressed={playing}
+            >
+              {playing ? (
+                <>
+                  <Pause className="size-4" />
+                  Stop tone
+                </>
+              ) : (
+                <>
+                  <Play className="size-4" />
+                  Play tone
+                </>
+              )}
             </Button>
+            <p className="text-center text-xs text-muted-foreground">
+              {playing ? (
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="relative flex size-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
+                    <span className="relative inline-flex size-2 rounded-full bg-primary" />
+                  </span>
+                  playing — it runs until you stop it
+                </span>
+              ) : (
+                "no duration, no export — just a tone"
+              )}
+            </p>
           </ControlsCard>
         </div>
 
         <div className="flex flex-col gap-6">
-          {result ? (
-            <>
-              <ABPlayer
-                original={result}
-                fs={FS}
-                labelA="Tone"
-                hint="Press play — use the level slider if it's too loud"
-              />
-              <DownloadPanel
-                channels={result}
-                fs={FS}
-                toolId="frequency-generator"
-              />
-            </>
-          ) : (
-            <InfoBanner>
-              <strong>Why a frequency generator?</strong> Find out what your
-              speakers can really do. Play a 30 Hz sine — if you hear nothing,
-              your rig can't reproduce sub-bass (the Rebasser's 29–34 Hz band
-              lives exactly there). Run a 20 Hz–20 kHz sweep to find rattles,
-              resonances and your speakers' real limits. Careful with the
-              volume — pure tones at high level can damage drivers.
-            </InfoBanner>
-          )}
+          <InfoBanner>
+            <strong>Why a frequency generator?</strong> Find out what your
+            speakers can really do. Play a 30 Hz sine — if you hear nothing,
+            your rig can&apos;t reproduce sub-bass (the Rebasser&apos;s 29–34
+            Hz band lives exactly there). Sweep up by dragging the slider to
+            find rattles, resonances and your speakers&apos; real limits.
+            <strong> Careful with the volume</strong> — pure tones at high
+            level can damage drivers and hearing.
+          </InfoBanner>
+          <InfoBanner>
+            <strong>Tips.</strong> Deep sines are felt more than heard — on
+            laptops and phone speakers anything below ~60 Hz is mostly
+            silence, and that&apos;s normal. Start low, turn up slowly. If a
+            tone seems to vanish around one frequency but is audible on both
+            sides, you&apos;ve found a room resonance or a speaker dip.
+          </InfoBanner>
         </div>
       </ToolGrid>
     </ToolPage>

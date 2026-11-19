@@ -438,7 +438,7 @@ export function Home() {
             specs={[
               "18–140 Hz custom band",
               "follows your bassline",
-              "sine · saturated · triangle",
+              "boosted pure-sine sub",
             ]}
           />
           <FeaturedCard

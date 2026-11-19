@@ -7,10 +7,9 @@
  *  2. Transcribe the bassline to semitone notes and shift the WHOLE line
  *     by one global octave so its median centers on the user's target
  *     band. A global shift preserves every interval exactly — the sub
- *     plays the same melody, note for note, just deeper. Two modes:
- *     "calm" follows every note (floor-clamped so nothing sinks below
- *     the band), "extreme" locks onto the bassline's DOMINANT note per
- *     section — a steady in-band sub at full pressure, zero bouncing.
+ *     plays the same melody, note for note, just deeper. Every note is
+ *     followed (floor-clamped so nothing sinks below the band) — one
+ *     raw, loud sub, no modes, no characters, pure sine.
  *     Frame data is applied at the CENTER of each analysis window (see
  *     BassAnalysis.centerOffsetSec) plus a note-confirmation delay
  *     (~1.5 hops): a straddling window can lock onto a new note's attack
@@ -20,9 +19,10 @@
  *  3. Remove the original low end with a steep high-pass (cached per
  *     cutoff/slope). "Auto" clears the entire detected bassline, not just
  *     the sub band, so the track never plays two bass lines at once.
- *  4. Synthesize the new sub: constant per-note frequency with a short
- *     portamento glide between notes, plus a per-sample attack/release
- *     envelope scaled to the sub period. A line-level anti-collision
+ *  4. Synthesize the new sub: a pure sine with constant per-note
+ *     frequency, a short portamento glide between notes, and a
+ *     per-sample attack/release envelope scaled to the sub period. A
+ *     line-level anti-collision
  *     guard never leaves the sub's core in unison with original notes
  *     that survive the removal filter — two sines at the same pitch
  *     drift in and out of phase, the classic "two basses wobbling"
@@ -53,9 +53,7 @@ import {
 } from "./dsp";
 import { analyzeBass, type BassAnalysis } from "./pitch";
 
-export type RebassWaveform = "sine" | "saturated" | "triangle";
 export type RebassFollow = "slow" | "natural" | "fast";
-export type RebassMode = "extreme" | "calm";
 
 export interface RebassOptions {
   /** target band, e.g. 29–34 Hz */
@@ -72,15 +70,7 @@ export interface RebassOptions {
   removeSlope: 12 | 24 | 36 | 48;
   /** sub level relative to the original bass level, dB */
   subLevelDb: number;
-  waveform: RebassWaveform;
   follow: RebassFollow;
-  /**
-   * "extreme": the sub locks onto the bassline's dominant note per
-   * section — a steady, saturated sub that stays inside the band and
-   * hits at full pressure (the stress-your-speakers rebass).
-   * "calm": the sub follows the bassline note for note, gently.
-   */
-  mode: RebassMode;
 }
 
 export interface RebassInfo {
@@ -112,22 +102,12 @@ const FOLLOW_TIMES: Record<
   fast: { glide: 0.012, atk: 0.01, rel: 0.08 },
 };
 
-/** sub output peak ceiling (dBFS) — keeps the limiter out of sub cycles */
-const SUB_PEAK_CAP_DB = -3.5;
-
-function synthWaveform(phase: number, kind: RebassWaveform): number {
-  switch (kind) {
-    case "sine":
-      return Math.sin(phase);
-    case "saturated": {
-      const s = Math.sin(phase);
-      const drive = 2.1;
-      return Math.tanh(drive * s) / Math.tanh(drive);
-    }
-    case "triangle":
-      return (2 / Math.PI) * Math.asin(Math.sin(phase));
-  }
-}
+/**
+ * sub output peak ceiling (dBFS). Kept just under the limiter ceiling
+ * so the sub dominates the mix without the limiter riding every sub
+ * cycle (which trembles the low end) — raw pressure, clean sine.
+ */
+const SUB_PEAK_CAP_DB = -1.5;
 
 /* ------------------------------------------------------------------ */
 /* Per-file cache (analysis + high-passed dry signal)                   */
@@ -236,9 +216,8 @@ export interface BasslineMap {
  * is normal rebass behaviour and does not beat.)
  *
  * Never below the band: every mapped frequency is held at or above
- * rangeLow (calm) or clamped into the band (extreme), so a 29–34 Hz
- * setting never turns into a 20 Hz rumble small speakers can't even
- * reproduce.
+ * rangeLow, so a 29–34 Hz setting never turns into a 20 Hz rumble
+ * small speakers can't even reproduce.
  */
 export function mapBasslineNotes(
   analysis: BassAnalysis,
@@ -247,9 +226,7 @@ export function mapBasslineNotes(
   /** resolved removal cutoff in Hz — originals near/above it survive */
   cutoffHz: number,
   /** removal filter steepness in dB/oct — decides how far below the cutoff a note is still audible */
-  removeSlopeDb: number,
-  /** extreme: dominant-note sub locked inside the band; calm: melodic */
-  mode: RebassMode
+  removeSlopeDb: number
 ): BasslineMap {
   const frames = analysis.frames;
   const fc = Math.sqrt(low * high);
@@ -361,66 +338,16 @@ export function mapBasslineNotes(
   let minHz = Infinity;
   let maxHz = 0;
 
-  if (mode === "extreme") {
-    /* Dominant-note sub: the median of the snapped notes in a ±1 s
-     * window per frame, then a debounced switch (the new dominant must
-     * hold ~0.4 s before the pitch moves). The sub sits on one steady
-     * pitch per section, always inside the band, and pumps with the
-     * track's own bass envelope — maximum pressure, and by design it
-     * cannot bounce up and down octaves. */
-    const W = Math.max(5, Math.round(1.0 / analysis.hopSec));
-    const HOLD = Math.max(3, Math.round(0.4 / analysis.hopSec));
-    const dom = new Int32Array(frames).fill(NO_NOTE);
-    const vals: number[] = [];
-    for (let i = 0; i < frames; i++) {
-      vals.length = 0;
-      for (let j = Math.max(0, i - W); j <= Math.min(frames - 1, i + W); j++) {
-        if (noteIdx[j] !== NO_NOTE) vals.push(noteIdx[j]);
-      }
-      if (vals.length >= 3) {
-        vals.sort((a, b) => a - b);
-        dom[i] = vals[Math.floor(vals.length / 2)];
-      }
-    }
-    // debounce: hold the current pitch until a different dominant note
-    // has persisted for HOLD frames (≈0.4 s)
-    let cur = NO_NOTE;
-    let cand = NO_NOTE;
-    let hold = 0;
-    for (let i = 0; i < frames; i++) {
-      const d = dom[i];
-      if (cur === NO_NOTE && d !== NO_NOTE) {
-        cur = d;
-      } else if (d !== NO_NOTE && d !== cur) {
-        if (d === cand) {
-          hold++;
-          if (hold >= HOLD) {
-            cur = d;
-            cand = NO_NOTE;
-            hold = 0;
-          }
-        } else {
-          cand = d;
-          hold = 1;
-        }
-      } else if (d === cur) {
-        cand = NO_NOTE;
-        hold = 0;
-      }
-      if (cur !== NO_NOTE) {
-        const hz = Math.min(high, Math.max(low, noteToHz(cur - 12 * kStar)));
-        targets[i] = hz;
-        if (hz < minHz) minHz = hz;
-        if (hz > maxHz) maxHz = hz;
-      }
-    }
-  } else {
-    /* Calm melodic mapping: run-by-run targets like before, but every
-     * note is held at or above the band floor. Notes that used to map
-     * to 16–25 Hz (inaudible on almost any speaker, and the reason a
-     * "29–34 Hz" rebass sounded like 20 Hz or less) now sit AT the
-     * floor instead of sinking under it — no octave-fold jumps, just a
-     * gentle floor. */
+  /* Melodic mapping: run-by-run targets, every note held at or above
+   * the band floor. Notes that would map to 16–25 Hz (inaudible on
+   * almost any speaker, and the reason a "29–34 Hz" rebass sounded
+   * like 20 Hz or less) sit AT the floor instead of sinking under it.
+   * (The old "extreme" mode locked onto the dominant note of a ±1 s
+   * median window — on busy basslines that median never flipped, so
+   * the sub sat on ONE pitch for the whole song while the band's other
+   * notes never got played, and when it did flip it landed up to a
+   * second late. Following every note fixes both.) */
+  {
     let lastNote: number | null = null;
     for (const r of runs) {
       const runNote = r.len >= 2 ? r.note : lastNote;
@@ -504,8 +431,7 @@ export async function processRebass(
     low,
     high,
     cutoffHz,
-    opts.removeSlope,
-    opts.mode
+    opts.removeSlope
   );
 
   // per-frame amplitude target (0..1), normalized so p95 of active = 1.
@@ -619,7 +545,7 @@ export async function processRebass(
     phase += inc;
     if (phase >= 2 * Math.PI) phase -= 2 * Math.PI;
 
-    sub[n] = synthWaveform(phase, opts.waveform) * envState;
+    sub[n] = Math.sin(phase) * envState;
     envTrack[n] = envState;
     if (envState > 0.02) subActive++;
 
@@ -740,10 +666,8 @@ export function rebassDefaults(): RebassOptions {
     rangeHigh: 34,
     removeBelowHz: "auto",
     removeSlope: 48,
-    subLevelDb: 6,
-    waveform: "saturated",
+    subLevelDb: 10,
     follow: "fast",
-    mode: "extreme",
   };
 }
 

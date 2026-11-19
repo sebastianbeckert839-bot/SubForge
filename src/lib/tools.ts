@@ -250,9 +250,9 @@ export const TOOLS: ToolMeta[] = [
   {
     id: "frequency-generator",
     name: "Frequency Generator",
-    tagline: "Test tones & sweeps from 20 Hz to 20 kHz",
+    tagline: "Live test tones, 20 Hz to 20 kHz",
     description:
-      "Generate pure sine, square, triangle or sawtooth tones at any frequency, or sweep across the whole spectrum. Perfect for testing speakers and subs, finding rattles and resonances, or picking your rebass band.",
+      "A pure test tone that plays until you stop it — drag the frequency slider in real time while it sounds. Sine, square, triangle or sawtooth, from 20 Hz to 20 kHz. Perfect for testing speakers and subs, finding rattles, or picking your rebass band.",
     category: "analysis",
     icon: "WaveSquare",
     suffix: "tone",
