@@ -38,17 +38,16 @@ import {
   videoDims,
   DEFAULT_SETTINGS,
   STYLE_PRESETS,
-  BETTER_PRESETS,
   FONT_OPTIONS,
   defaultVizPos,
   fontFamily,
+  makeVizRenderState,
   type VizSettings,
   type VizPreset,
   type ColorMode,
   type VizFormat,
   type TextFont,
   type TextAlign,
-  type VizRenderState,
 } from "@/lib/visualizer/render";
 
 /* ------------------------------------------------------------------ */
@@ -237,7 +236,6 @@ export default function VisualizerTool() {
     progress: 0,
   });
   const [activeStyle, setActiveStyle] = useState<string>("forge");
-  const [activeBetter, setActiveBetter] = useState<string>("none");
   const [dragMode, setDragMode] = useState<DragMode>("off");
   const [activeLayout, setActiveLayout] = useState<string | undefined>();
   const [activeBgChip, setActiveBgChip] = useState<string | undefined>();
@@ -250,7 +248,6 @@ export default function VisualizerTool() {
   const offsetRef = useRef(0);
   const rafRef = useRef(0);
   const lastFrameRef = useRef(0);
-  const peaksRef = useRef<Float32Array>(new Float32Array(0));
   const freqRef = useRef<Uint8Array>(new Uint8Array(0));
   const timeRef = useRef<Uint8Array>(new Uint8Array(0));
   const cancelExportRef = useRef(false);
@@ -258,14 +255,11 @@ export default function VisualizerTool() {
   const lastPosUiRef = useRef(0);
   const draggingRef = useRef(false);
 
-  // decoded images + per-canvas render state (bass smoothing, particles)
+  // decoded images + per-canvas render state (bass smoothing, particles,
+  // ripple rings)
   const bgImgRef = useRef<HTMLImageElement | null>(null);
   const centerImgRef = useRef<HTMLImageElement | null>(null);
-  const vizStateRef = useRef<VizRenderState>({
-    bass: 0,
-    parts: new Float32Array(0),
-    partCount: 0,
-  });
+  const vizStateRef = useRef(makeVizRenderState());
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -464,7 +458,6 @@ export default function VisualizerTool() {
         settings: s,
         t: ts / 1000,
         progress: duration > 0 ? posRef.current / duration : 0,
-        peaks: peaksRef.current,
         dt,
         bgImg: bgImgRef.current,
         centerImg: centerImgRef.current,
@@ -500,25 +493,6 @@ export default function VisualizerTool() {
     const p = STYLE_PRESETS.find((x) => x.id === id);
     if (!p) return;
     setActiveStyle(id);
-    setActiveBetter("none");
-    setSettings((s) => ({ ...s, ...p.settings }));
-  }, []);
-
-  const applyBetterPreset = useCallback((id: string) => {
-    const p = BETTER_PRESETS.find((x) => x.id === id);
-    if (!p) return;
-    setActiveBetter(id);
-    setActiveStyle("");
-    setActiveLayout(undefined);
-    setActiveBgChip(
-      p.settings.bgImage === undefined
-        ? undefined
-        : p.settings.bgImage === null
-          ? "None"
-          : p.settings.bgImage === "use-center"
-            ? "Album art (blurred)"
-            : BG_CHIPS.find((c) => c.url === p.settings.bgImage)?.label
-    );
     setSettings((s) => ({ ...s, ...p.settings }));
   }, []);
 
@@ -606,9 +580,9 @@ export default function VisualizerTool() {
 
       const freq = new Uint8Array(analyser.frequencyBinCount);
       const time = new Uint8Array(analyser.fftSize);
-      const peaks = new Float32Array(0);
-      // fresh render state so particles/bass don't carry over from preview
-      const state: VizRenderState = { bass: 0, parts: new Float32Array(0), partCount: 0 };
+      // fresh render state so particles / bass / ripples don't carry over
+      // from the preview
+      const state = makeVizRenderState();
 
       const stream = canvas.captureStream(s.fps);
       for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
@@ -653,7 +627,6 @@ export default function VisualizerTool() {
             settings: settingsRef.current,
             t: ts / 1000,
             progress: totalSec > 0 ? elapsed / totalSec : 0,
-            peaks,
             dt,
             bgImg: bgImgRef.current,
             centerImg: centerImgRef.current,
@@ -712,50 +685,24 @@ export default function VisualizerTool() {
 
   /* --------------------------- render ------------------------------ */
 
-  const barLike = [
-    "bars",
-    "mirror",
-    "radial",
-    "hanging",
-    "flank",
-    "lines",
-  ].includes(settings.preset);
-  const hasCenterArt =
-    settings.preset === "blob" || settings.preset === "flank" || settings.preset === "lines";
+  const barLike = ["bars", "mirror", "radial"].includes(settings.preset);
+  const ringStyle =
+    settings.preset === "halo" ||
+    settings.preset === "vinyl" ||
+    settings.preset === "ripple";
+  const hasCenterArt = ringStyle || settings.preset === "radial";
 
   return (
     <ToolPage toolId="visualizer" wide>
       <ToolGrid>
         <div className="flex flex-col gap-6">
-          {/* ---------------- Better Visualizers ---------------- */}
-          <ControlsCard
-            title="Better Visualizers"
-            description="The premium looks — photo backgrounds, floating particles, bass-reactive blur, custom fonts and draggable layout. Pick one, then tune literally everything below."
-          >
-            <SelectRow<string>
-              label="Premium style"
-              value={activeBetter}
-              onChange={(v) => {
-                if (v !== "none") applyBetterPreset(v);
-              }}
-              options={[
-                { value: "none", label: "Choose a style…" },
-                ...BETTER_PRESETS.map((p) => ({ value: p.id, label: p.label })),
-              ]}
-            />
-            <p className="text-xs text-muted-foreground">
-              Every premium style needs your music playing to come alive — press
-              play in the preview and watch the background pump with the bass.
-            </p>
-          </ControlsCard>
-
-          {/* ---------------- classic styles ---------------- */}
+          {/* ---------------- styles ---------------- */}
           <ControlsCard
             title="Style presets"
-            description="Ten classic looks, one click each — then tweak anything below."
+            description="Thirteen full looks, one click each — then tweak literally everything below."
           >
             <PresetChips
-              presets={STYLE_PRESETS.filter((p) => !p.premium).map((p) => ({
+              presets={STYLE_PRESETS.map((p) => ({
                 label: p.label,
                 apply: () => applyStylePreset(p.id),
               }))}
@@ -764,20 +711,16 @@ export default function VisualizerTool() {
             <SelectRow<VizPreset>
               label="Visualizer type"
               value={settings.preset}
-              onChange={(v) => {
-                setActiveBetter("none");
-                set("preset", v);
-              }}
+              onChange={(v) => set("preset", v)}
               options={[
                 { value: "bars", label: "Frequency bars" },
                 { value: "mirror", label: "Mirror bars" },
-                { value: "radial", label: "Radial ring" },
+                { value: "radial", label: "Radial ring — your photo in the middle" },
                 { value: "freq-wave", label: "Frequency wave (spectrum curve)" },
                 { value: "wave", label: "Waveform (oscilloscope)" },
-                { value: "hanging", label: "Hanging wave — premium" },
-                { value: "flank", label: "Flank bars — premium" },
-                { value: "lines", label: "Flank lines — premium" },
-                { value: "blob", label: "Liquid blob — premium" },
+                { value: "halo", label: "Halo ring — smooth circle around your photo" },
+                { value: "vinyl", label: "Spinning vinyl — your art on a record" },
+                { value: "ripple", label: "Bass ripples — rings pulse out on the bass" },
               ]}
             />
             <SelectRow<ColorMode>
@@ -1041,49 +984,64 @@ export default function VisualizerTool() {
               <>
                 <SliderRow
                   label={
-                    settings.preset === "radial"
-                      ? "Bars in the ring"
-                      : settings.preset === "lines"
-                        ? "Lines per side"
-                        : "Number of bars"
+                    settings.preset === "radial" ? "Bars in the ring" : "Number of bars"
                   }
                   value={settings.barCount}
-                  min={settings.preset === "lines" ? 20 : 8}
-                  max={
-                    settings.preset === "radial"
-                      ? 240
-                      : settings.preset === "lines"
-                        ? 120
-                        : 200
-                  }
+                  min={8}
+                  max={settings.preset === "radial" ? 240 : 200}
                   step={1}
                   onChange={(v) => set("barCount", Math.round(v))}
                   format={(v) => `${Math.round(v)}`}
                 />
-                {settings.preset !== "lines" ? (
+                <SliderRow
+                  label="Bar gap"
+                  value={settings.barGap}
+                  min={0}
+                  max={0.8}
+                  step={0.01}
+                  onChange={(v) => set("barGap", v)}
+                  format={(v) => `${Math.round(v * 100)}%`}
+                />
+                <ToggleRow
+                  label="Rounded bars"
+                  checked={settings.roundedBars}
+                  onChange={(v) => set("roundedBars", v)}
+                />
+              </>
+            ) : ringStyle ? (
+              <>
+                {settings.preset === "halo" ? (
                   <SliderRow
-                    label="Bar gap"
-                    value={settings.barGap}
+                    label="Ring detail"
+                    value={settings.barCount}
+                    min={24}
+                    max={160}
+                    step={4}
+                    onChange={(v) => set("barCount", Math.round(v))}
+                    format={(v) => `${Math.round(v)} points`}
+                    hint="More points = smoother ring"
+                  />
+                ) : null}
+                <SliderRow
+                  label={settings.preset === "ripple" ? "Halo spread" : "Ring spread"}
+                  value={settings.haloSpread}
+                  min={0.04}
+                  max={0.3}
+                  step={0.01}
+                  onChange={(v) => set("haloSpread", v)}
+                  format={(v) => `${Math.round(v * 100)}%`}
+                  hint="How thick the reacting ring can get"
+                />
+                {settings.preset === "halo" || settings.preset === "vinyl" ? (
+                  <SliderRow
+                    label="Edge line"
+                    value={settings.lineWidth}
                     min={0}
-                    max={0.8}
-                    step={0.01}
-                    onChange={(v) => set("barGap", v)}
-                    format={(v) => `${Math.round(v * 100)}%`}
-                  />
-                ) : null}
-                {settings.preset !== "lines" ? (
-                  <ToggleRow
-                    label="Rounded bars"
-                    checked={settings.roundedBars}
-                    onChange={(v) => set("roundedBars", v)}
-                  />
-                ) : null}
-                {settings.preset === "bars" || settings.preset === "mirror" ? (
-                  <ToggleRow
-                    label="Peak caps"
-                    description="Floating dots that mark each bar's recent peak"
-                    checked={settings.capDots}
-                    onChange={(v) => set("capDots", v)}
+                    max={8}
+                    step={0.5}
+                    onChange={(v) => set("lineWidth", v)}
+                    format={(v) => (v < 0.05 ? "Off" : `${v.toFixed(1)} px`)}
+                    hint="Stroke along the outer edge of the ring"
                   />
                 ) : null}
               </>
@@ -1117,6 +1075,28 @@ export default function VisualizerTool() {
                 format={(v) => `${v.toFixed(2)}×`}
               />
             ) : null}
+            {ringStyle ? (
+              <SliderRow
+                label={
+                  settings.preset === "vinyl"
+                    ? "Spin speed"
+                    : settings.preset === "ripple"
+                      ? "Ripple speed"
+                      : "Spin"
+                }
+                value={settings.rotateSpeed}
+                min={settings.preset === "ripple" ? 0.2 : 0}
+                max={settings.preset === "ripple" ? 3 : 2}
+                step={0.05}
+                onChange={(v) => set("rotateSpeed", v)}
+                format={(v) => `${v.toFixed(2)}×`}
+                hint={
+                  settings.preset === "ripple"
+                    ? "How fast the rings expand outward"
+                    : undefined
+                }
+              />
+            ) : null}
             <SliderRow
               label="Sensitivity"
               value={settings.sensitivity}
@@ -1144,8 +1124,8 @@ export default function VisualizerTool() {
             title="Center art"
             description={
               hasCenterArt
-                ? "The artwork in the middle of the blob / flank styles."
-                : "Used by the Blob, Flank bars and Flank lines styles — and by the “Album art (blurred)” background."
+                ? "Your photo right in the middle — inside the ring, the halo or on the record."
+                : "Used by the circular styles (Ring, Halo, Vinyl, Ripples) and the “Album art (blurred)” background."
             }
           >
             <ImageUploadRow

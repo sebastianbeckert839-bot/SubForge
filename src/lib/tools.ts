@@ -262,7 +262,7 @@ export const TOOLS: ToolMeta[] = [
     name: "Video Visualizer",
     tagline: "Turn any track into a 1080p60 video",
     description:
-      "Render your music as bars, waves or a radial ring — fully customizable colors, bar counts, glow, titles and more — then export a 1080p 60fps video in 16:9 for YouTube, 9:16 for TikTok, square or 4:5. What you see in the live preview is exactly what gets exported.",
+      "Render your music as bars, waves, a bar ring around your own photo, a smooth halo circle, a spinning vinyl or bass ripples — fully customizable colors, fonts, photo backgrounds, titles and drag-anywhere layout — then export a 1080p 60fps video in 16:9 for YouTube, 9:16 for TikTok, square or 4:5. What you see in the live preview is exactly what gets exported.",
     category: "visual",
     icon: "Clapperboard",
     suffix: "visualizer",

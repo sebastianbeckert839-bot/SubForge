@@ -2,15 +2,15 @@
  * Visualizer engine — pure canvas rendering shared by the live preview and
  * the exported video, so what you see is exactly what you get.
  *
- * Two tiers of styles:
- *  - Classic: bars / mirror / radial / freq-wave / wave.
- *  - "Better Visualizers" (premium): photo-background styles with floating
- *    particles, bass-reactive background blur + darken, draggable text and
- *    visualizer anchors, custom fonts, and center-art styles:
- *      hanging — waveform hanging down from a line under the text
- *      flank   — mirrored bar clusters flanking a center artwork
- *      lines   — frequency "equalizer ladder" lines beside the artwork
- *      blob    — wobbling liquid blob with a glowing rim and art inside
+ * Styles: bars / mirror / radial / freq-wave / wave +
+ *   halo  — smooth circular spectrum ring around your photo
+ *           (top of the ring = bass, bottom = highs, sides = mids)
+ *   vinyl — your art spinning on a record with a reacting ring
+ *   ripple — rings pulse outward from your art on bass hits
+ *
+ * Everything is customizable on every style: photo backgrounds with blur /
+ * darken / bass pulse, floating particles, custom fonts, draggable text and
+ * visualizer placement, colors, glow, sensitivity and more.
  */
 
 export type VizPreset =
@@ -19,10 +19,9 @@ export type VizPreset =
   | "radial"
   | "freq-wave"
   | "wave"
-  | "hanging"
-  | "flank"
-  | "lines"
-  | "blob";
+  | "halo"
+  | "vinyl"
+  | "ripple";
 export type ColorMode = "solid" | "gradient" | "rainbow";
 export type VizFormat = "16:9" | "9:16" | "1:1" | "4:5";
 export type TextFont =
@@ -39,12 +38,11 @@ export type TextAlign = "left" | "center" | "right";
 
 export interface VizSettings {
   preset: VizPreset;
-  /** number of bars / spectrum points (bar + radial presets) */
+  /** number of bars / spectrum points (bar, radial and ring styles) */
   barCount: number;
   /** 0..0.9 — gap between bars as a fraction of the bar slot */
   barGap: number;
   roundedBars: boolean;
-  capDots: boolean;
   colorMode: ColorMode;
   color1: string;
   color2: string;
@@ -55,10 +53,10 @@ export interface VizSettings {
   smoothing: number;
   /** 0.4..3 */
   sensitivity: number;
-  /** stroke width for the line presets, px at 1080p reference */
+  /** stroke width for the line + ring styles, px at 1080p reference */
   lineWidth: number;
   fillWave: boolean;
-  /** 0..2 rotation speed for the radial preset */
+  /** 0..2 rotation speed (radial bars, halo spin, vinyl spin, ripple speed) */
   rotateSpeed: number;
   showTitle: boolean;
   titleText: string;
@@ -70,7 +68,7 @@ export interface VizSettings {
   bitrateMbps: number;
   exportLength: "full" | 15 | 30 | 60;
 
-  /* ---------------- background & atmosphere (Better Visualizers) ------ */
+  /* ---------------- background & atmosphere -------------------------- */
   /** image URL / data-URL behind everything; "use-center" mirrors the
    *  center artwork as a blurred background (the album-art look) */
   bgImage: string | null;
@@ -105,12 +103,17 @@ export interface VizSettings {
   /** normalized anchor; y < 0 → auto (per-preset default) */
   vizPos: { x: number; y: number };
 
-  /* ---------------- center art (blob / flank / lines) ----------------- */
+  /* ---------------- center art (radial / halo / vinyl / ripple) ------ */
   centerImage: string | null;
   /** fraction of min(w,h), 0.08..0.45 */
   centerSize: number;
   /** 0 = square, 1 = circle */
   centerRound: number;
+
+  /* ---------------- ring styles -------------------------------------- */
+  /** thickness of the halo / vinyl / ripple band as a fraction of
+   *  min(w,h), 0.04..0.3 */
+  haloSpread: number;
 }
 
 export const DEFAULT_SETTINGS: VizSettings = {
@@ -118,7 +121,6 @@ export const DEFAULT_SETTINGS: VizSettings = {
   barCount: 64,
   barGap: 0.3,
   roundedBars: true,
-  capDots: true,
   colorMode: "gradient",
   color1: "#f97316",
   color2: "#fbbf24",
@@ -157,6 +159,7 @@ export const DEFAULT_SETTINGS: VizSettings = {
   centerImage: null,
   centerSize: 0.3,
   centerRound: 0,
+  haloSpread: 0.16,
 };
 
 /* ------------------------------------------------------------------ */
@@ -164,7 +167,7 @@ export const DEFAULT_SETTINGS: VizSettings = {
 /* ------------------------------------------------------------------ */
 
 /** display fonts for the text overlays (loaded via the Google Fonts
- *  stylesheet in the root layout; canvas falls back to system-ui until
+ *  stylesheet injected by the tool; canvas falls back to system-ui until
  *  the font arrives) */
 export const FONT_OPTIONS: { value: TextFont; label: string; family: string }[] =
   [
@@ -194,8 +197,6 @@ export function fontFamily(key: TextFont): string {
 export interface StylePreset {
   id: string;
   label: string;
-  /** premium styles live in the "Better Visualizers" dropdown */
-  premium?: boolean;
   settings: Partial<VizSettings>;
 }
 
@@ -212,7 +213,6 @@ export const STYLE_PRESETS: StylePreset[] = [
       glow: 45,
       barCount: 64,
       roundedBars: true,
-      capDots: true,
     },
   },
   {
@@ -224,7 +224,6 @@ export const STYLE_PRESETS: StylePreset[] = [
       bg: "#070510",
       glow: 80,
       barCount: 96,
-      capDots: true,
     },
   },
   {
@@ -290,7 +289,6 @@ export const STYLE_PRESETS: StylePreset[] = [
       glow: 0,
       barCount: 48,
       roundedBars: false,
-      capDots: false,
     },
   },
   {
@@ -334,201 +332,63 @@ export const STYLE_PRESETS: StylePreset[] = [
     },
   },
 
-  /* ---------------- Better Visualizers (premium) ------------------- */
+  /* ---------------- new circular styles ---------------------------- */
 
   {
-    id: "skyline",
-    label: "Skyline — monochrome city, hanging wave",
-    premium: true,
+    id: "halo",
+    label: "Halo",
     settings: {
-      preset: "hanging",
-      colorMode: "solid",
-      color1: "#ffffff",
+      preset: "halo",
+      colorMode: "gradient",
+      color1: "#f97316",
+      color2: "#fde047",
       bg: "#0b0b0d",
-      bgImage: "/viz/bg-skyline.jpg",
-      bgBlur: 0,
-      bgDark: 0.2,
-      bgBass: 0.75,
-      vignette: 0.35,
-      particles: 70,
-      particleSpeed: 1.5,
-      glow: 0,
-      barCount: 72,
-      barGap: 0.22,
-      sensitivity: 1.15,
-      font: "modern",
-      textUppercase: true,
-      titleScale: 1.7,
-      artistScale: 0.8,
-      showArtist: false,
-      textColor: "#f4f4f5",
-      textPos: { x: 0.5, y: 0.26 },
-      align: "center",
-      vizPos: { x: 0.5, y: 0.46 },
-    },
-  },
-  {
-    id: "dusk-ridge",
-    label: "Dusk Ridge — mountains, glowing wave",
-    premium: true,
-    settings: {
-      preset: "freq-wave",
-      colorMode: "gradient",
-      color1: "#ff5a2a",
-      color2: "#ffb03a",
-      bg: "#0a1218",
-      bgImage: "/viz/bg-ridge.jpg",
-      bgBlur: 2,
-      bgDark: 0.22,
-      bgBass: 0.5,
-      vignette: 0.4,
-      particles: 45,
-      particleSpeed: 0.9,
-      glow: 55,
-      lineWidth: 4,
-      fillWave: false,
-      sensitivity: 1.3,
-      font: "grotesk",
-      textUppercase: false,
-      titleScale: 0.9,
-      artistScale: 1.35,
-      showArtist: true,
-      textColor: "#ffffff",
-      textPos: { x: 0.5, y: 0.58 },
-      align: "center",
-      vizPos: { x: 0.5, y: 0.42 },
-    },
-  },
-  {
-    id: "neon-ember",
-    label: "Neon Ember — red city, liquid blob",
-    premium: true,
-    settings: {
-      preset: "blob",
-      colorMode: "gradient",
-      color1: "#ff4500",
-      color2: "#ffb03a",
-      bg: "#0a0302",
-      bgImage: "/viz/bg-neon.jpg",
-      bgBlur: 3,
-      bgDark: 0.3,
-      bgBass: 0.6,
-      vignette: 0.45,
-      particles: 90,
-      particleSpeed: 1.6,
-      glow: 70,
-      sensitivity: 1.2,
-      font: "modern",
-      textUppercase: false,
-      titleScale: 0.85,
-      artistScale: 1.25,
-      showArtist: true,
-      textColor: "#ffffff",
-      textPos: { x: 0.5, y: 0.74 },
-      align: "center",
-      vizPos: { x: 0.5, y: 0.42 },
-      centerSize: 0.3,
-      centerRound: 1,
-    },
-  },
-  {
-    id: "vortex-ghost",
-    label: "Vortex Ghost — teal spiral, liquid blob",
-    premium: true,
-    settings: {
-      preset: "blob",
-      colorMode: "gradient",
-      color1: "#9be9ff",
-      color2: "#2fb8d8",
-      bg: "#04141a",
-      bgImage: "/viz/bg-vortex.jpg",
-      bgBlur: 4,
-      bgDark: 0.25,
-      bgBass: 0.55,
-      vignette: 0.5,
-      particles: 60,
-      particleSpeed: 0.8,
       glow: 60,
-      sensitivity: 1.15,
-      font: "grotesk",
-      textUppercase: false,
-      titleScale: 0.85,
-      artistScale: 1.25,
-      showArtist: true,
-      textColor: "#eafcff",
-      textPos: { x: 0.5, y: 0.74 },
-      align: "center",
-      vizPos: { x: 0.5, y: 0.42 },
+      barCount: 96,
+      lineWidth: 2.5,
+      haloSpread: 0.16,
       centerSize: 0.3,
       centerRound: 1,
+      sensitivity: 1.2,
+      rotateSpeed: 0,
     },
   },
   {
-    id: "album-flank",
-    label: "Album Flank — your art, mirrored bars",
-    premium: true,
+    id: "vinyl",
+    label: "Spinning Vinyl",
     settings: {
-      preset: "flank",
-      colorMode: "solid",
-      color1: "#ffffff",
-      bg: "#0d0d10",
-      bgImage: "use-center",
-      bgBlur: 55,
-      bgDark: 0.38,
-      bgBass: 0.4,
-      vignette: 0.3,
-      particles: 0,
-      glow: 0,
-      barCount: 56,
-      barGap: 0.35,
-      sensitivity: 1.1,
-      font: "modern",
-      textUppercase: false,
-      titleScale: 0.8,
-      artistScale: 1.3,
-      showArtist: true,
-      textColor: "#ffffff",
-      textPos: { x: 0.5, y: 0.79 },
-      align: "center",
-      vizPos: { x: 0.5, y: 0.45 },
-      centerSize: 0.34,
-      centerRound: 0.1,
-    },
-  },
-  {
-    id: "flank-lines",
-    label: "Flank Lines — minimal ladder equalizer",
-    premium: true,
-    settings: {
-      preset: "lines",
-      colorMode: "solid",
-      color1: "#ffffff",
-      bg: "#0d0d10",
-      bgImage: "use-center",
-      bgBlur: 50,
-      bgDark: 0.42,
-      bgBass: 0.35,
-      vignette: 0.35,
-      particles: 0,
-      glow: 0,
-      barCount: 48,
+      preset: "vinyl",
+      colorMode: "gradient",
+      color1: "#fbbf24",
+      color2: "#f97316",
+      bg: "#0c0a08",
+      glow: 45,
+      lineWidth: 2,
+      haloSpread: 0.11,
+      centerSize: 0.24,
+      centerRound: 1,
+      rotateSpeed: 0.3,
       sensitivity: 1.15,
-      font: "condensed",
-      textUppercase: true,
-      titleScale: 0.75,
-      artistScale: 1.45,
-      showArtist: true,
-      textColor: "#ffffff",
-      textPos: { x: 0.5, y: 0.79 },
-      align: "center",
-      vizPos: { x: 0.5, y: 0.45 },
-      centerSize: 0.34,
-      centerRound: 0,
+    },
+  },
+  {
+    id: "ripple",
+    label: "Bass Ripples",
+    settings: {
+      preset: "ripple",
+      colorMode: "gradient",
+      color1: "#22d3ee",
+      color2: "#a855f7",
+      bg: "#04070e",
+      glow: 65,
+      haloSpread: 0.09,
+      centerSize: 0.3,
+      centerRound: 1,
+      rotateSpeed: 1,
+      sensitivity: 1.3,
     },
   },
 ];
-
-export const BETTER_PRESETS = STYLE_PRESETS.filter((p) => p.premium);
 
 /** default visualizer anchor per preset (used when vizPos.y < 0 and to
  *  materialize a position when the user starts dragging) */
@@ -539,13 +399,10 @@ export function defaultVizPos(preset: VizPreset): { x: number; y: number } {
     case "wave":
       return { x: 0.5, y: 0.46 };
     case "radial":
-    case "flank":
-    case "lines":
+    case "halo":
+    case "vinyl":
+    case "ripple":
       return { x: 0.5, y: 0.5 };
-    case "hanging":
-      return { x: 0.5, y: 0.46 };
-    case "blob":
-      return { x: 0.5, y: 0.42 };
     default:
       return { x: 0.5, y: 0.9 };
   }
@@ -607,16 +464,24 @@ function rgba(hex: string, a: number): string {
   return `rgba(${r},${g},${b},${a})`;
 }
 
-/** color for bar i of n — solid, position gradient or animated rainbow */
+function mixHex(a: string, b: string, u: number): string {
+  const A = hexToRgb(a);
+  const B = hexToRgb(b);
+  return rgbToHex(
+    A[0] + (B[0] - A[0]) * u,
+    A[1] + (B[1] - A[1]) * u,
+    A[2] + (B[2] - A[2]) * u
+  );
+}
+
+/** color for element i of n — solid, position gradient or animated rainbow */
 function elementColor(s: VizSettings, i: number, n: number, t: number): string {
   if (s.colorMode === "rainbow") {
     return `hsl(${(((i / n) * 320 + t * 40) % 360 + 360) % 360} 85% 60%)`;
   }
   if (s.colorMode === "gradient") {
     const u = n <= 1 ? 0 : i / (n - 1);
-    const [r1, g1, b1] = hexToRgb(s.color1);
-    const [r2, g2, b2] = hexToRgb(s.color2);
-    return rgbToHex(r1 + (r2 - r1) * u, g1 + (g2 - g1) * u, b1 + (b2 - b1) * u);
+    return mixHex(s.color1, s.color2, u);
   }
   return s.color1;
 }
@@ -651,14 +516,40 @@ function bandValue(
 /* The renderer                                                        */
 /* ------------------------------------------------------------------ */
 
-/** per-canvas mutable state (bass smoothing, particles) — the caller owns
- *  one instance per canvas (preview + one fresh per export) */
+/** an expanding ripple ring (bass ripples style) */
+export interface VizRing {
+  /** spawn time, seconds on the render clock */
+  t0: number;
+  /** bass energy at spawn, 0..1 */
+  strong: number;
+}
+
+/** per-canvas mutable state (bass smoothing, particles, ripple rings) —
+ *  the caller owns one instance per canvas (preview + one fresh per
+ *  export) */
 export interface VizRenderState {
   /** smoothed bass energy 0..1 */
   bass: number;
+  /** bass on the previous frame — attack detection for ripples */
+  bassPrev: number;
+  /** last ripple spawn time */
+  lastSpawn: number;
   /** particle data, 4 floats each: x, y, upward speed px/s, phase */
   parts: Float32Array;
   partCount: number;
+  /** live ripple rings */
+  rings: VizRing[];
+}
+
+export function makeVizRenderState(): VizRenderState {
+  return {
+    bass: 0,
+    bassPrev: 0,
+    lastSpawn: -10,
+    parts: new Float32Array(0),
+    partCount: 0,
+    rings: [],
+  };
 }
 
 export interface RenderInput {
@@ -675,13 +566,11 @@ export interface RenderInput {
   t: number;
   /** 0..1 position in the track */
   progress: number;
-  /** persistent per-bar peak heights (0..1); caller owns the state */
-  peaks: Float32Array;
-  /** seconds since last frame, for peak decay */
+  /** seconds since last frame (bass release, particles, ripples) */
   dt: number;
   /** decoded background image, if the settings reference one */
   bgImg?: HTMLImageElement | null;
-  /** decoded center artwork (blob / flank / lines + "use-center" bg) */
+  /** decoded center artwork (radial / halo / vinyl / ripple + "use-center" bg) */
   centerImg?: HTMLImageElement | null;
   /** per-canvas mutable state; created on first call if missing */
   state?: VizRenderState;
@@ -778,13 +667,8 @@ function drawCenterArt(
 
 export function drawFrame(inp: RenderInput): void {
   const { ctx, w, h, settings: s, t } = inp;
-  if (!inp.state) inp.state = { bass: 0, parts: new Float32Array(0), partCount: 0 };
+  if (!inp.state) inp.state = makeVizRenderState();
   const st = inp.state;
-  const need = s.preset === "wave" || s.preset === "blob" || s.preset === "lines" ? 0 : s.barCount;
-  if (inp.peaks.length !== need) {
-    inp.peaks = new Float32Array(need);
-  }
-  const peaks = inp.peaks;
 
   ctx.save();
 
@@ -839,13 +723,13 @@ export function drawFrame(inp: RenderInput): void {
 
   switch (s.preset) {
     case "bars":
-      drawBars(inp, peaks, false, glowPx, scaleRef, anchor);
+      drawBars(inp, false, glowPx, scaleRef, anchor);
       break;
     case "mirror":
-      drawBars(inp, peaks, true, glowPx, scaleRef, anchor);
+      drawBars(inp, true, glowPx, scaleRef, anchor);
       break;
     case "radial":
-      drawRadial(inp, peaks, glowPx, scaleRef, anchor);
+      drawRadial(inp, glowPx, scaleRef, anchor);
       break;
     case "freq-wave":
       drawFreqWave(inp, glowPx, scaleRef, anchor);
@@ -853,17 +737,14 @@ export function drawFrame(inp: RenderInput): void {
     case "wave":
       drawWave(inp, glowPx, scaleRef, anchor);
       break;
-    case "hanging":
-      drawHanging(inp, peaks, glowPx, scaleRef, anchor);
+    case "halo":
+      drawHalo(inp, glowPx, scaleRef, anchor);
       break;
-    case "flank":
-      drawFlank(inp, peaks, glowPx, scaleRef, anchor);
+    case "vinyl":
+      drawVinyl(inp, glowPx, scaleRef, anchor, bass);
       break;
-    case "lines":
-      drawLines(inp, glowPx, scaleRef, anchor);
-      break;
-    case "blob":
-      drawBlob(inp, glowPx, scaleRef, anchor, bass);
+    case "ripple":
+      drawRipple(inp, st, glowPx, scaleRef, anchor, bass);
       break;
   }
 
@@ -889,13 +770,12 @@ export function drawFrame(inp: RenderInput): void {
 
 function drawBars(
   inp: RenderInput,
-  peaks: Float32Array,
   mirror: boolean,
   glowPx: number,
   scaleRef: number,
   anchor: { x: number; y: number }
 ): void {
-  const { ctx, w, h, freq, sampleRate, settings: s, t, dt } = inp;
+  const { ctx, w, h, freq, sampleRate, settings: s, t } = inp;
   const n = Math.max(8, Math.min(256, Math.round(s.barCount)));
   const padX = w * 0.04;
   const hasTitle =
@@ -912,15 +792,11 @@ function drawBars(
   const slot = (w - padX * 2) / n;
   const bw = Math.max(1, slot * (1 - s.barGap));
   const r = s.roundedBars ? Math.min(bw / 2, 12 * scaleRef) : 0;
-  const decay = 0.9 * dt; // peak gravity, per second
 
   for (let i = 0; i < n; i++) {
     const v = Math.min(1, bandValue(freq, sampleRate, i, n) * s.sensitivity);
-    const p = Math.max(v, (peaks[i] ?? 0) - decay);
-    peaks[i] = p;
-
     const barH = Math.max(v * maxHalf, v > 0.02 ? 2 : 0);
-    if (barH <= 0 && p <= 0.001) continue;
+    if (barH <= 0) continue;
     const x = padX + i * slot + (slot - bw) / 2;
     const color = elementColor(s, i, n, t);
 
@@ -934,13 +810,6 @@ function drawBars(
     } else {
       roundRectPath(ctx, x, cy - barH, bw, barH, r);
       ctx.fill();
-      if (s.capDots && p > 0.02) {
-        ctx.shadowBlur = glowPx * 0.6;
-        const capY = cy - p * maxHalf - 8 * scaleRef;
-        ctx.beginPath();
-        ctx.arc(x + bw / 2, capY, Math.max(1.5, bw * 0.28), 0, Math.PI * 2);
-        ctx.fill();
-      }
     }
   }
   ctx.shadowBlur = 0;
@@ -978,26 +847,26 @@ function roundRectPath(
 
 function drawRadial(
   inp: RenderInput,
-  peaks: Float32Array,
   glowPx: number,
   scaleRef: number,
   anchor: { x: number; y: number }
 ): void {
-  const { ctx, w, h, freq, sampleRate, settings: s, t, dt } = inp;
+  const { ctx, w, h, freq, sampleRate, settings: s, t } = inp;
   const n = Math.max(16, Math.min(240, Math.round(s.barCount)));
   const cx = anchor.x;
   const cy = anchor.y;
   const m = Math.min(w, h);
-  const r0 = m * 0.17;
+  // center artwork (optional) sits inside the ring of bars
+  const artSize = inp.centerImg ? Math.max(24, s.centerSize * m) : 0;
+  const r0 = Math.max(m * 0.17, artSize ? (artSize / 2) * 1.18 : 0);
   const maxLen = m * 0.26;
   const bw = ((Math.PI * 2 * r0) / n) * (1 - s.barGap);
   const rotation = t * s.rotateSpeed;
-  const decay = 0.9 * dt;
+
+  if (artSize > 0) drawCenterArt(inp, cx, cy, artSize, s.centerRound);
 
   for (let i = 0; i < n; i++) {
     const v = Math.min(1, bandValue(freq, sampleRate, i, n) * s.sensitivity);
-    const p = Math.max(v, (peaks[i] ?? 0) - decay);
-    peaks[i] = p;
     if (v <= 0.005) continue;
 
     const ang = (i / n) * Math.PI * 2 + rotation;
@@ -1015,11 +884,6 @@ function drawRadial(
       ctx.fill();
     } else {
       ctx.fillRect(-bw / 2, r0, bw, len);
-    }
-    if (s.capDots && p > 0.03) {
-      ctx.beginPath();
-      ctx.arc(0, r0 + p * maxLen + 12 * scaleRef, Math.max(1.5, bw * 0.3), 0, Math.PI * 2);
-      ctx.fill();
     }
     ctx.restore();
   }
@@ -1128,222 +992,382 @@ function drawWave(
   ctx.shadowBlur = 0;
 }
 
-/* --------------------- hanging waveform (premium) ------------------ */
+/* ---------------------- smooth circular spectrum ------------------ */
 
-function drawHanging(
-  inp: RenderInput,
-  peaks: Float32Array,
-  glowPx: number,
-  scaleRef: number,
-  anchor: { x: number; y: number }
-): void {
-  const { ctx, w, h, freq, sampleRate, settings: s, t, dt } = inp;
-  const n = Math.max(16, Math.min(160, Math.round(s.barCount)));
-  const spanW = Math.min(w * 0.7, Math.max(w * 0.4, w * 0.62));
-  const x0 = anchor.x - spanW / 2;
-  const lineY = anchor.y;
-  const maxDrop = h * 0.17;
-  const slot = spanW / n;
-  const bw = Math.max(1, slot * (1 - s.barGap));
-  const decay = 0.9 * dt;
-
-  // anchor line
-  ctx.fillStyle = "rgba(255,255,255,0.28)";
-  ctx.fillRect(x0, lineY - Math.max(1, scaleRef), spanW, Math.max(2, 2 * scaleRef));
-
+/** sample the spectrum around a circle: index 0 = top (bass), half way =
+ *  bottom (highs), mirrored so both sides show mids — the "ball" mapping
+ *  where the top of the circle is low bass and the bottom is treble */
+function circularBands(
+  freq: Uint8Array,
+  sampleRate: number,
+  n: number
+): Float32Array {
+  const half = Math.max(8, Math.floor(n / 2));
+  const raw = new Float32Array(half);
+  for (let i = 0; i < half; i++) {
+    raw[i] = bandValue(freq, sampleRate, i, half);
+  }
+  // gaussian-ish 5-tap smoothing so the ring flows instead of spiking
+  const sm = new Float32Array(half);
+  const K = [1, 4, 6, 4, 1];
+  for (let i = 0; i < half; i++) {
+    let acc = 0;
+    for (let k = -2; k <= 2; k++) {
+      const j = Math.max(0, Math.min(half - 1, i + k));
+      acc += raw[j] * K[k + 2];
+    }
+    sm[i] = acc / 16;
+  }
+  const out = new Float32Array(n);
+  const halfN = n / 2;
   for (let i = 0; i < n; i++) {
-    const v = Math.min(1, bandValue(freq, sampleRate, i, n) * s.sensitivity);
-    const p = Math.max(v, (peaks[i] ?? 0) - decay);
-    peaks[i] = p;
-    const drop = Math.max(v * maxDrop, v > 0.02 ? 2 : 0);
-    if (drop <= 0 && p <= 0.001) continue;
-    const x = x0 + i * slot + (slot - bw) / 2;
-    const color = elementColor(s, i, n, t);
-    ctx.shadowBlur = glowPx > 0.5 ? glowPx : 0;
-    if (glowPx > 0.5) ctx.shadowColor = color;
-    ctx.fillStyle = color;
-    ctx.fillRect(x, lineY, bw, drop);
+    const u = i <= halfN ? i / halfN : (n - i) / halfN;
+    out[i] = sm[Math.min(half - 1, Math.round(u * (half - 1)))];
   }
-  ctx.shadowBlur = 0;
-}
-
-/* ---------------- flank bar clusters (premium) --------------------- */
-
-function drawFlank(
-  inp: RenderInput,
-  peaks: Float32Array,
-  glowPx: number,
-  scaleRef: number,
-  anchor: { x: number; y: number }
-): void {
-  const { ctx, w, h, freq, sampleRate, settings: s, t, dt } = inp;
-  const size = Math.max(24, s.centerSize * Math.min(w, h));
-  const artHalf = size / 2;
-  const gapX = artHalf * 1.28;
-  const cx = anchor.x;
-  const cy = anchor.y;
-  const nSide = Math.max(12, Math.min(80, Math.round(s.barCount / 2)));
-  const clusterW = Math.min((w / 2 - gapX - w * 0.05) * 0.92, w * 0.24);
-  const slot = clusterW / nSide;
-  const bw = Math.max(1, slot * (1 - s.barGap));
-  const maxHalf = Math.min(h * 0.2, size * 0.62);
-  const decay = 0.9 * dt;
-
-  drawCenterArt(inp, cx, cy, size, s.centerRound);
-
-  for (const dir of [-1, 1] as const) {
-    for (let i = 0; i < nSide; i++) {
-      // mirrored bins: i=0 at the outer edge … i=nSide-1 beside the art
-      const bin = dir < 0 ? nSide - 1 - i : i;
-      const u = i / Math.max(1, nSide - 1); // 0 outer … 1 near art
-      const win = Math.pow(Math.sin(Math.PI * (0.12 + 0.88 * u)), 0.65);
-      const v = Math.min(
-        1,
-        bandValue(freq, sampleRate, bin, nSide) * s.sensitivity * win
-      );
-      const idx = dir < 0 ? i : nSide + i;
-      const p = Math.max(v, (peaks[idx] ?? 0) - decay);
-      peaks[idx] = p;
-      const bh = Math.max(v * maxHalf, v > 0.02 ? 2 : 0);
-      if (bh <= 0) continue;
-      const x =
-        dir < 0
-          ? cx - gapX - clusterW + i * slot + (slot - bw) / 2
-          : cx + gapX + i * slot + (slot - bw) / 2;
-      const color = elementColor(s, dir < 0 ? i : nSide - 1 - i, nSide, t);
-      ctx.shadowBlur = glowPx > 0.5 ? glowPx : 0;
-      if (glowPx > 0.5) ctx.shadowColor = color;
-      ctx.fillStyle = color;
-      ctx.fillRect(x, cy - bh, bw, bh * 2);
-    }
-  }
-  ctx.shadowBlur = 0;
-}
-
-/* ---------------- flank line ladders (premium) --------------------- */
-
-function drawLines(
-  inp: RenderInput,
-  glowPx: number,
-  scaleRef: number,
-  anchor: { x: number; y: number }
-): void {
-  const { ctx, w, h, freq, sampleRate, settings: s, t } = inp;
-  const size = Math.max(24, s.centerSize * Math.min(w, h));
-  const artHalf = size / 2;
-  const gapX = artHalf * 1.2;
-  const cx = anchor.x;
-  const cy = anchor.y;
-  const n = Math.max(20, Math.min(120, Math.round(s.barCount)));
-  const stackH = Math.min(h * 0.56, size * 1.95);
-  const maxLen = Math.min(w * 0.12, (w / 2 - gapX - w * 0.06) * 0.9);
-  const lineH = Math.max(1.5, 2.6 * scaleRef);
-
-  drawCenterArt(inp, cx, cy, size, s.centerRound);
-
-  for (const dir of [-1, 1] as const) {
+  // second pass around the circle (wraps the seam at the top)
+  let soft = out;
+  for (let pass = 0; pass < 2; pass++) {
+    const next = new Float32Array(n);
     for (let i = 0; i < n; i++) {
-      const u = i / Math.max(1, n - 1); // 0 bottom … 1 top
-      // hourglass mapping: low bins near the vertical center, highs at
-      // the outer ends — the classic "equalizer ladder" silhouette
-      const dist = Math.abs(u - 0.5) * 2; // 0 center … 1 edges
-      const bin = Math.round((1 - dist) * (n - 1) * 0.55);
-      const v = Math.min(1, bandValue(freq, sampleRate, bin, n) * s.sensitivity);
-      const len = Math.max(v * maxLen, v > 0.02 ? 2 : 0);
-      if (len <= 0) continue;
-      const y = cy - stackH / 2 + u * stackH - lineH / 2;
-      const x = dir < 0 ? cx - gapX - len : cx + gapX;
-      const color = elementColor(s, i, n, t);
-      ctx.shadowBlur = glowPx > 0.5 ? glowPx : 0;
-      if (glowPx > 0.5) ctx.shadowColor = color;
-      ctx.fillStyle = color;
-      ctx.fillRect(x, y, len, lineH);
+      next[i] =
+        (soft[(i - 1 + n) % n] + soft[i] * 2 + soft[(i + 1) % n]) / 4;
     }
+    soft = next;
   }
-  ctx.shadowBlur = 0;
+  return soft;
 }
 
-/* ----------------------- liquid blob (premium) --------------------- */
+/** smooth closed curve through points (quadratic through midpoints) */
+function smoothClosedPath(
+  ctx: CanvasRenderingContext2D,
+  pts: { x: number; y: number }[]
+): void {
+  const n = pts.length;
+  if (n < 3) return;
+  const mid = (a: { x: number; y: number }, b: { x: number; y: number }) => ({
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2,
+  });
+  const start = mid(pts[n - 1], pts[0]);
+  ctx.moveTo(start.x, start.y);
+  for (let i = 0; i < n; i++) {
+    const p = pts[i];
+    const next = mid(p, pts[(i + 1) % n]);
+    ctx.quadraticCurveTo(p.x, p.y, next.x, next.y);
+  }
+}
 
-function drawBlob(
+/**
+ * The reacting ring shared by the halo / vinyl / ripple styles: a smooth
+ * band whose thickness follows the spectrum around the circle (bass at
+ * the top, highs at the bottom), filled with the configured colors and
+ * stroked along its outer edge.
+ */
+function drawHaloBand(
+  inp: RenderInput,
+  cx: number,
+  cy: number,
+  r0: number,
+  band: number,
+  glowPx: number,
+  scaleRef: number,
+  rotation: number,
+  edgeWidth: number
+): void {
+  const { ctx, freq, sampleRate, settings: s, t } = inp;
+  const n = Math.max(24, Math.min(160, Math.round(s.barCount)));
+  const vals = circularBands(freq, sampleRate, n);
+
+  const outer: { x: number; y: number }[] = [];
+  const innerStart = { x: 0, y: 0 };
+  for (let i = 0; i < n; i++) {
+    const v = Math.min(1, vals[i] * s.sensitivity);
+    // soften spikes + keep a visible base ring even in silence, so it
+    // always reads as a ring that swells — never a collapsing blob
+    const e = Math.pow(v, 0.88);
+    const th = (i / n) * Math.PI * 2 - Math.PI / 2 + rotation; // start at top
+    const r = r0 + band * (0.16 + 0.84 * e);
+    outer.push({ x: cx + Math.cos(th) * r, y: cy + Math.sin(th) * r });
+    if (i === 0) {
+      innerStart.x = cx + Math.cos(th) * r0;
+      innerStart.y = cy + Math.sin(th) * r0;
+    }
+  }
+
+  /* fill the band: outer curve forward, inner circle backward */
+  let fill: string | CanvasGradient;
+  if (s.colorMode === "gradient") {
+    const g = ctx.createRadialGradient(cx, cy, r0, cx, cy, r0 + band);
+    g.addColorStop(0, rgba(s.color1, 0.95));
+    g.addColorStop(1, rgba(s.color2, 0.95));
+    fill = g;
+  } else if (s.colorMode === "rainbow") {
+    const conic = (
+      ctx as CanvasRenderingContext2D & {
+        createConicGradient?: (
+          startAngle: number,
+          x: number,
+          y: number
+        ) => CanvasGradient;
+      }
+    ).createConicGradient;
+    if (typeof conic === "function") {
+      const g = conic.call(ctx, rotation - Math.PI / 2, cx, cy);
+      for (let k = 0; k <= 6; k++) {
+        g.addColorStop(k / 6, `hsl(${(k / 6) * 320 + (t * 40) % 360} 85% 60%)`);
+      }
+      fill = g;
+    } else {
+      const g = ctx.createLinearGradient(cx - r0 - band, cy, cx + r0 + band, cy);
+      for (let k = 0; k <= 4; k++) {
+        g.addColorStop(k / 4, `hsl(${(k / 4) * 320 + (t * 40) % 360} 85% 60%)`);
+      }
+      fill = g;
+    }
+  } else {
+    fill = rgba(s.color1, 0.95);
+  }
+
+  ctx.save();
+  ctx.beginPath();
+  smoothClosedPath(ctx, outer);
+  ctx.lineTo(innerStart.x, innerStart.y);
+  // travel the inner circle backwards → nonzero winding leaves the
+  // middle (behind the art) unfilled
+  const a0 = -Math.PI / 2 + rotation;
+  ctx.arc(cx, cy, r0, a0, a0 - Math.PI * 2, true);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.shadowBlur = glowPx > 0.5 ? glowPx * 0.8 : 0;
+  if (glowPx > 0.5) ctx.shadowColor = s.colorMode === "solid" ? s.color1 : s.color2;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  /* outer edge stroke */
+  if (edgeWidth > 0.05) {
+    ctx.beginPath();
+    smoothClosedPath(ctx, outer);
+    ctx.strokeStyle =
+      s.colorMode === "solid" ? s.color1 : mixHex(s.color1, s.color2, 0.65);
+    ctx.lineWidth = Math.max(1, edgeWidth * scaleRef * 2);
+    ctx.lineJoin = "round";
+    ctx.shadowBlur = glowPx > 0.5 ? glowPx : 0;
+    if (glowPx > 0.5) ctx.shadowColor = s.color2;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  ctx.restore();
+}
+
+/* ------------------------------ halo ------------------------------ */
+
+function drawHalo(
+  inp: RenderInput,
+  glowPx: number,
+  scaleRef: number,
+  anchor: { x: number; y: number }
+): void {
+  const { ctx, w, h, settings: s, t } = inp;
+  const m = Math.min(w, h);
+  const cx = anchor.x;
+  const cy = anchor.y;
+
+  const artSize = Math.max(24, s.centerSize * m);
+  drawCenterArt(inp, cx, cy, artSize, s.centerRound);
+
+  const r0 = (artSize / 2) * 1.16 + 6 * scaleRef;
+  const band = Math.max(6 * scaleRef, m * s.haloSpread);
+  drawHaloBand(inp, cx, cy, r0, band, glowPx, scaleRef, t * s.rotateSpeed, s.lineWidth);
+}
+
+/* ------------------------------ vinyl ----------------------------- */
+
+function drawVinyl(
   inp: RenderInput,
   glowPx: number,
   scaleRef: number,
   anchor: { x: number; y: number },
   bass: number
 ): void {
-  const { ctx, w, h, freq, sampleRate, settings: s, t } = inp;
+  const { ctx, w, h, settings: s, t } = inp;
   const m = Math.min(w, h);
-  const baseR = (Math.max(24, s.centerSize * m) / 2) * (1 + bass * 0.16);
   const cx = anchor.x;
   const cy = anchor.y;
 
-  // overall loudness → wobble energy
-  let loud = 0;
-  for (let b = 2; b < Math.min(freq.length, 60); b++) loud += freq[b];
-  loud = Math.min(1, (loud / 58 / 255) * 1.5);
+  const labelSize = Math.max(24, s.centerSize * m); // the spinning image
+  const discR = (labelSize / 2) * 1.9 + 8 * scaleRef;
+  const spin = t * s.rotateSpeed;
 
-  const path = new Path2D();
-  const STEPS = 96;
-  for (let i = 0; i <= STEPS; i++) {
-    const th = (i / STEPS) * Math.PI * 2;
-    const wob =
-      0.055 * Math.sin(3 * th + t * 1.4) * (0.55 + bass * 0.9) +
-      0.035 * Math.sin(5 * th - t * 2.2) * (0.4 + loud * 0.8) +
-      0.02 * Math.sin(8 * th + t * 0.7);
-    const r = baseR * (1 + wob);
-    const x = cx + Math.cos(th) * r;
-    const y = cy + Math.sin(th) * r;
-    if (i === 0) path.moveTo(x, y);
-    else path.lineTo(x, y);
-  }
-  path.closePath();
+  // reacting ring around the disc
+  drawHaloBand(
+    inp,
+    cx,
+    cy,
+    discR * 1.07,
+    Math.max(6 * scaleRef, m * s.haloSpread),
+    glowPx,
+    scaleRef,
+    spin * 0.4,
+    s.lineWidth
+  );
 
-  // dark body
   ctx.save();
-  ctx.shadowColor = "rgba(0,0,0,0.55)";
-  ctx.shadowBlur = baseR * 0.16;
-  ctx.fillStyle = "#0a0a0c";
-  ctx.fill(path);
-  ctx.restore();
+  ctx.translate(cx, cy);
+  const pulse = 1 + bass * 0.035;
+  ctx.scale(pulse, pulse);
 
-  // center image clipped inside the blob (fallback: soft glyph)
+  // disc body
+  const g = ctx.createRadialGradient(0, 0, discR * 0.2, 0, 0, discR);
+  g.addColorStop(0, "#17171c");
+  g.addColorStop(0.75, "#0d0d10");
+  g.addColorStop(1, "#08080a");
+  ctx.shadowColor = "rgba(0,0,0,0.55)";
+  ctx.shadowBlur = discR * 0.14;
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(0, 0, discR, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // grooves
+  for (let k = 0; k < 5; k++) {
+    const gr = discR * (0.62 + k * 0.075);
+    ctx.strokeStyle = `rgba(255,255,255,${(0.05 + k * 0.014).toFixed(3)})`;
+    ctx.lineWidth = Math.max(1, (2.4 - k * 0.3) * scaleRef);
+    ctx.beginPath();
+    ctx.arc(0, 0, gr, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // fixed sheen — light catching the grooves while the record spins
+  ctx.strokeStyle = "rgba(255,255,255,0.10)";
+  ctx.lineWidth = Math.max(2, 7 * scaleRef);
+  ctx.beginPath();
+  ctx.arc(0, 0, discR * 0.82, -Math.PI * 0.78, -Math.PI * 0.42);
+  ctx.stroke();
+
+  // spinning label (your image, cover-cropped into a circle)
+  ctx.save();
+  ctx.rotate(spin);
+  ctx.beginPath();
+  ctx.arc(0, 0, labelSize / 2, 0, Math.PI * 2);
+  ctx.clip();
   if (inp.centerImg) {
-    ctx.save();
-    ctx.clip(path);
     const img = inp.centerImg;
-    const scale = Math.max((baseR * 2.1) / img.width, (baseR * 2.1) / img.height);
+    const scale = Math.max(labelSize / img.width, labelSize / img.height);
     const dw = img.width * scale;
     const dh = img.height * scale;
-    ctx.globalAlpha = 0.94;
-    ctx.drawImage(img, cx - dw / 2, cy - dh / 2, dw, dh);
-    ctx.restore();
+    ctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
   } else {
-    ctx.save();
-    ctx.clip(path);
+    // placeholder glyph so it's obvious where the image goes
     const bc = rgba(contrastOn(s.bg), 0.9);
+    const bw = labelSize * 0.11;
     for (let k = -1; k <= 1; k++) {
-      const bw = baseR * 0.14;
-      const bh = baseR * (k === 0 ? 0.9 : 0.55);
-      roundRectPath(ctx, cx + k * baseR * 0.42 - bw / 2, cy - bh / 2, bw, bh, bw / 2);
+      const bh = labelSize * (k === 0 ? 0.42 : 0.26);
+      roundRectPath(ctx, k * labelSize * 0.24 - bw / 2, -bh / 2, bw, bh, bw / 2);
       ctx.fillStyle = bc;
       ctx.fill();
     }
-    ctx.restore();
   }
+  ctx.restore();
 
-  // glowing rim
-  const rimA = s.colorMode === "solid" ? s.color1 : s.color1;
-  const rimB = s.colorMode === "solid" ? s.color1 : s.color2;
-  const grad = ctx.createLinearGradient(cx - baseR, cy - baseR, cx + baseR, cy + baseR);
-  grad.addColorStop(0, rimA);
-  grad.addColorStop(1, rimB);
-  ctx.strokeStyle = grad;
-  ctx.lineWidth = Math.max(2, 5 * scaleRef);
-  ctx.shadowBlur = glowPx > 0.5 ? glowPx * 1.5 : 12 * scaleRef;
-  ctx.shadowColor = rimB;
-  ctx.stroke(path);
-  ctx.shadowBlur = 0;
+  // label ring + spindle
+  ctx.strokeStyle = rgba(s.colorMode === "solid" ? s.color1 : s.color2, 0.4);
+  ctx.lineWidth = Math.max(1, 3 * scaleRef);
+  ctx.beginPath();
+  ctx.arc(0, 0, labelSize / 2 + Math.max(1.5, 3 * scaleRef), 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = "#1c1c21";
+  ctx.beginPath();
+  ctx.arc(0, 0, Math.max(3, 6 * scaleRef), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#050507";
+  ctx.beginPath();
+  ctx.arc(0, 0, Math.max(1.5, 2.5 * scaleRef), 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.restore();
+}
+
+/* ----------------------------- ripple ----------------------------- */
+
+/** ripple lifetime, seconds */
+const RING_LIFE = 1.7;
+
+function drawRipple(
+  inp: RenderInput,
+  st: VizRenderState,
+  glowPx: number,
+  scaleRef: number,
+  anchor: { x: number; y: number },
+  bass: number
+): void {
+  const { ctx, w, h, settings: s, t } = inp;
+  const m = Math.min(w, h);
+  const cx = anchor.x;
+  const cy = anchor.y;
+
+  const artSize = Math.max(24, s.centerSize * m);
+  drawCenterArt(inp, cx, cy, artSize, s.centerRound);
+  const r0 = (artSize / 2) * 1.14 + 6 * scaleRef;
+
+  /* spawn a ring on every bass attack */
+  if (
+    bass > 0.3 &&
+    bass > st.bassPrev + 0.04 &&
+    t - st.lastSpawn > 0.16
+  ) {
+    st.rings.push({ t0: t, strong: bass });
+    st.lastSpawn = t;
+    if (st.rings.length > 12) st.rings.shift();
+  }
+  st.bassPrev = bass;
+  st.rings = st.rings.filter((r) => t - r.t0 < RING_LIFE);
+
+  /* thin reacting halo hugging the art */
+  drawHaloBand(
+    inp,
+    cx,
+    cy,
+    r0,
+    Math.max(5 * scaleRef, m * s.haloSpread),
+    glowPx,
+    scaleRef,
+    t * s.rotateSpeed * 0.3,
+    Math.max(1, s.lineWidth * 0.7)
+  );
+
+  /* expanding rings */
+  const speed = Math.max(0.15, s.rotateSpeed);
+  for (const ring of st.rings) {
+    const p = Math.min(1, (t - ring.t0) / RING_LIFE); // 0..1
+    const r = r0 + p * m * 0.42 * speed * (0.7 + ring.strong * 0.5);
+    const alpha = Math.pow(1 - p, 1.6) * (0.3 + ring.strong * 0.55);
+    if (alpha <= 0.01) continue;
+
+    let color: string;
+    if (s.colorMode === "rainbow") {
+      color = `hsl(${(p * 300 + t * 40) % 360} 85% 60%)`;
+    } else if (s.colorMode === "gradient") {
+      color = mixHex(s.color1, s.color2, p);
+    } else {
+      color = s.color1;
+    }
+
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = Math.max(
+      2,
+      (1 - p) * 11 * scaleRef * (0.5 + ring.strong * 0.7)
+    );
+    ctx.shadowBlur = glowPx > 0.5 ? glowPx * 0.7 : 0;
+    if (glowPx > 0.5) ctx.shadowColor = color;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+  }
 }
 
 /* -------------------------- particles ----------------------------- */
