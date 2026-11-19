@@ -1,0 +1,751 @@
+     1→/**
+     2→ * The Rebasser — flagship processor.
+     3→ *
+     4→ * Pipeline:
+     5→ *  1. Analyze the track's bassline (pitch track + envelope, see pitch.ts).
+     6→ *     The analysis is cached per file so live-preview re-runs are fast.
+     7→ *  2. Transcribe the bassline to semitone notes and shift the WHOLE line
+     8→ *     by one global octave so its median centers on the user's target
+     9→ *     band. A global shift preserves every interval exactly — the sub
+    10→ *     plays the same melody, note for note, just deeper. Two modes:
+    11→ *     "calm" follows every note (floor-clamped so nothing sinks below
+    12→ *     the band), "extreme" locks onto the bassline's DOMINANT note per
+    13→ *     section — a steady in-band sub at full pressure, zero bouncing.
+    14→ *     Frame data is applied at the CENTER of each analysis window (see
+    15→ *     BassAnalysis.centerOffsetSec) plus a note-confirmation delay
+    16→ *     (~1.5 hops): a straddling window can lock onto a new note's attack
+    17→ *     up to ~100 ms before the note truly starts, which made the sub
+    18→ *     switch pitches before the original bass changed. The delay keeps
+    19→ *     the sub on the old note until the new one is actually there.
+    20→ *  3. Remove the original low end with a steep high-pass (cached per
+    21→ *     cutoff/slope). "Auto" clears the entire detected bassline, not just
+    22→ *     the sub band, so the track never plays two bass lines at once.
+    23→ *  4. Synthesize the new sub: constant per-note frequency with a short
+    24→ *     portamento glide between notes, plus a per-sample attack/release
+    25→ *     envelope scaled to the sub period. A line-level anti-collision
+    26→ *     guard never leaves the sub's core in unison with original notes
+    27→ *     that survive the removal filter — two sines at the same pitch
+    28→ *     drift in and out of phase, the classic "two basses wobbling"
+    29→ *     artefact. The guard shifts the WHOLE line one octave when needed
+    30→ *     (a single consistent move — the old per-note guard made
+    31→ *     individual notes leap octaves and the sub audibly bounced).
+    32→ *     "Survives" is measured slope-aware: an N dB/oct high-pass leaves
+    33→ *     a note below its corner only N·log2(corner/f) dB down, so notes
+    34→ *     several semitones below the cutoff still count as audible when
+    35→ *     the slope is gentle (or the note is close to the corner).
+    36→ *  5. Mix with a sidechain duck — while the sub sounds, the original's
+    37→ *     low band dips a few dB so the two layers never fight — then limit
+    38→ *     with a slow-release limiter whose release is far longer than a sub
+    39→ *     cycle, so it never wobbles the low end.
+    40→ */
+    41→
+    42→import {
+    43→  copyChannels,
+    44→  dbToGain,
+    45→  filterChannels,
+    46→  gainToDb,
+    47→  limitChannels,
+    48→  mixdown,
+    49→  truePeak,
+    50→  type Channels,
+    51→  type LimiterStats,
+    52→  type ProgressFn,
+    53→} from "./dsp";
+    54→import { analyzeBass, type BassAnalysis } from "./pitch";
+    55→
+    56→export type RebassWaveform = "sine" | "saturated" | "triangle";
+    57→export type RebassFollow = "slow" | "natural" | "fast";
+    58→export type RebassMode = "extreme" | "calm";
+    59→
+    60→export interface RebassOptions {
+    61→  /** target band, e.g. 29–34 Hz */
+    62→  rangeLow: number;
+    63→  rangeHigh: number;
+    64→  /**
+    65→   * High-pass the original below this frequency first (removes the
+    66→   * current bass). "auto" resolves inside processRebass to a cutoff that
+    67→   * clears the entire detected bassline — at least the top of the target
+    68→   * band — so the original line and the new sub never play at once.
+    69→   */
+    70→  removeBelowHz: number | "auto";
+    71→  /** high-pass steepness in dB/oct */
+    72→  removeSlope: 12 | 24 | 36 | 48;
+    73→  /** sub level relative to the original bass level, dB */
+    74→  subLevelDb: number;
+    75→  waveform: RebassWaveform;
+    76→  follow: RebassFollow;
+    77→  /**
+    78→   * "extreme": the sub locks onto the bassline's dominant note per
+    79→   * section — a steady, saturated sub that stays inside the band and
+    80→   * hits at full pressure (the stress-your-speakers rebass).
+    81→   * "calm": the sub follows the bassline note for note, gently.
+    82→   */
+    83→  mode: RebassMode;
+    84→}
+    85→
+    86→export interface RebassInfo {
+    87→  analysis: BassAnalysis;
+    88→  /** resolved removal cutoff in Hz (what "auto" became) */
+    89→  cutoffHz: number;
+    90→  /** actual sub frequency span produced, Hz; [0, 0] when nothing mapped */
+    91→  subRangeHz: [number, number];
+    92→  /** share of samples where the sub is audible */
+    93→  subActivePct: number;
+    94→  /** global octave shift applied to the bassline */
+    95→  octaveShift: number;
+    96→  /** sub output peak in dBFS */
+    97→  subPeakDb: number;
+    98→  limiter: LimiterStats;
+    99→  /** true when almost no bass was detected */
+   100→  lowConfidence: boolean;
+   101→  /** number of distinct bass notes mapped into the sub */
+   102→  noteCount: number;
+   103→}
+   104→
+   105→/** glide / attack / release times per follow mode (seconds) */
+   106→const FOLLOW_TIMES: Record<
+   107→  RebassFollow,
+   108→  { glide: number; atk: number; rel: number }
+   109→> = {
+   110→  slow: { glide: 0.045, atk: 0.04, rel: 0.28 },
+   111→  natural: { glide: 0.025, atk: 0.02, rel: 0.15 },
+   112→  fast: { glide: 0.012, atk: 0.01, rel: 0.08 },
+   113→};
+   114→
+   115→/** sub output peak ceiling (dBFS) — keeps the limiter out of sub cycles */
+   116→const SUB_PEAK_CAP_DB = -3.5;
+   117→
+   118→function synthWaveform(phase: number, kind: RebassWaveform): number {
+   119→  switch (kind) {
+   120→    case "sine":
+   121→      return Math.sin(phase);
+   122→    case "saturated": {
+   123→      const s = Math.sin(phase);
+   124→      const drive = 2.1;
+   125→      return Math.tanh(drive * s) / Math.tanh(drive);
+   126→    }
+   127→    case "triangle":
+   128→      return (2 / Math.PI) * Math.asin(Math.sin(phase));
+   129→  }
+   130→}
+   131→
+   132→/* ------------------------------------------------------------------ */
+   133→/* Per-file cache (analysis + high-passed dry signal)                   */
+   134→/* ------------------------------------------------------------------ */
+   135→
+   136→interface FileCache {
+   137→  analysis: BassAnalysis;
+   138→  envMax: number;
+   139→  gateDb: number;
+   140→  /** gated mean bass RMS (linear) of the original */
+   141→  bassRms: number;
+   142→  lowConfidence: boolean;
+   143→  /** single-slot cache for the high-passed original */
+   144→  hpKey: string | null;
+   145→  hpChannels: Channels | null;
+   146→}
+   147→
+   148→const fileCache = new WeakMap<Channels, FileCache>();
+   149→
+   150→async function getFileCache(
+   151→  chs: Channels,
+   152→  fs: number,
+   153→  onProgress?: ProgressFn
+   154→): Promise<FileCache> {
+   155→  let c = fileCache.get(chs);
+   156→  if (c) return c;
+   157→
+   158→  const analysis = await analyzeBass(chs, fs, async (f, s) => {
+   159→    if (onProgress) await onProgress(f * 0.5, s ?? "Analyzing bass");
+   160→  });
+   161→
+   162→  const frames = analysis.frames;
+   163→  let validFrames = 0;
+   164→  for (let i = 0; i < frames; i++) {
+   165→    if (analysis.f0[i] > 0 && analysis.conf[i] > 0.22) validFrames++;
+   166→  }
+   167→  const validRatio = frames > 0 ? validFrames / frames : 0;
+   168→  const lowConfidence = validFrames < 24 || validRatio < 0.02;
+   169→
+   170→  let envMax = -Infinity;
+   171→  for (let i = 0; i < analysis.envDb.length; i++) {
+   172→    if (analysis.envDb[i] > envMax) envMax = analysis.envDb[i];
+   173→  }
+   174→  if (!isFinite(envMax)) envMax = 0;
+   175→  const gateDb = envMax - 32;
+   176→
+   177→  let bassRmsSum = 0;
+   178→  let bassRmsCount = 0;
+   179→  for (let i = 0; i < frames; i++) {
+   180→    if (analysis.envDb[i] > gateDb) {
+   181→      bassRmsSum += Math.pow(10, (analysis.envDb[i] - envMax) / 20);
+   182→      bassRmsCount++;
+   183→    }
+   184→  }
+   185→  const bassRms = bassRmsCount > 0 ? bassRmsSum / bassRmsCount : 0.4;
+   186→
+   187→  c = {
+   188→    analysis,
+   189→    envMax,
+   190→    gateDb,
+   191→    bassRms,
+   192→    lowConfidence,
+   193→    hpKey: null,
+   194→    hpChannels: null,
+   195→  };
+   196→  fileCache.set(chs, c);
+   197→  return c;
+   198→}
+   199→
+   200→/* ------------------------------------------------------------------ */
+   201→/* Note transcription & octave mapping                                  */
+   202→/* ------------------------------------------------------------------ */
+   203→
+   204→/** nearest semitone index (12-TET; anchor is irrelevant, A1 = 55 Hz) */
+   205→function snapToNote(f: number): number {
+   206→  return Math.round(12 * Math.log2(f / 55));
+   207→}
+   208→
+   209→const noteToHz = (n: number) => 55 * Math.pow(2, n / 12);
+   210→
+   211→/** Result of transcribing + mapping the bassline into the sub band. */
+   212→export interface BasslineMap {
+   213→  /** mapped sub frequency per frame (Hz); 0 where nothing is mapped yet */
+   214→  targets: Float32Array;
+   215→  /** global octave shift applied to the whole line (−1 … 4) */
+   216→  octaveShift: number;
+   217→  /** distinct source notes mapped */
+   218→  noteCount: number;
+   219→  /** span of mapped sub frequencies over confirmed notes (Hz); [0,0] if none */
+   220→  subRange: [number, number];
+   221→}
+   222→
+   223→/**
+   224→ * Deterministic global mapping. The whole bassline is shifted by ONE
+   225→ * octave count (kStar) so its median centers on the band — intervals are
+   226→ * preserved exactly, so the sub plays the original melody instead of the
+   227→ * per-note "closest octave" zigzag (which turned a 2-semitone step into a
+   228→ * 10-semitone leap and sounded like a second, unrelated bass line).
+   229→ *
+   230→ * Line-level anti-collision guard: if the line's median note would land
+   231→ * in unison with an original note that survives the removal high-pass,
+   232→ * the WHOLE line shifts one more octave down — one consistent move, no
+   233→ * per-note leaps. Two sines at the same pitch but different phase drift
+   234→ * in and out of phase — the "two bass frequencies modulating each other"
+   235→ * wobble. (Octave-related originals collapsing onto the same sub pitch
+   236→ * is normal rebass behaviour and does not beat.)
+   237→ *
+   238→ * Never below the band: every mapped frequency is held at or above
+   239→ * rangeLow (calm) or clamped into the band (extreme), so a 29–34 Hz
+   240→ * setting never turns into a 20 Hz rumble small speakers can't even
+   241→ * reproduce.
+   242→ */
+   243→export function mapBasslineNotes(
+   244→  analysis: BassAnalysis,
+   245→  low: number,
+   246→  high: number,
+   247→  /** resolved removal cutoff in Hz — originals near/above it survive */
+   248→  cutoffHz: number,
+   249→  /** removal filter steepness in dB/oct — decides how far below the cutoff a note is still audible */
+   250→  removeSlopeDb: number,
+   251→  /** extreme: dominant-note sub locked inside the band; calm: melodic */
+   252→  mode: RebassMode
+   253→): BasslineMap {
+   254→  const frames = analysis.frames;
+   255→  const fc = Math.sqrt(low * high);
+   256→
+   257→  // global octave shift: line median → band center. One up-shift is
+   258→  // allowed for lines that already sit below the band.
+   259→  const med = analysis.medianF0 > 0 ? analysis.medianF0 : 55;
+   260→  let kStar = Math.round(Math.log2(med / fc));
+   261→  if (kStar < -1) kStar = -1;
+   262→  if (kStar > 4) kStar = 4;
+   263→
+   264→  // sentinel for "no confident bass this frame" — must NOT collide with a
+   265→  // real note index: notes below A1 (55 Hz) have negative indices too
+   266→  const NO_NOTE = -1000;
+   267→
+   268→  // snap every confident frame to a semitone index. Sticky deadband: once
+   269→  // a note is current, a frame only switches to another note when its f0
+   270→  // is clearly closer to it (> 0.85 semitone away). This kills the
+   271→  // semitone flip-flop on borderline/detuned basslines — and the pitch
+   272→  // sag of a decaying note (synth releases and plucked strings drift
+   273→  // flat at the tail) no longer flips the sub off its note before the
+   274→  // next note actually arrives.
+   275→  const noteIdx = new Int32Array(frames).fill(NO_NOTE);
+   276→  let curNote = Number.NaN;
+   277→  for (let i = 0; i < frames; i++) {
+   278→    const f = analysis.f0[i];
+   279→    if (f <= 0 || analysis.conf[i] <= 0.22) continue;
+   280→    if (Number.isFinite(curNote)) {
+   281→      const semi = Math.abs(12 * Math.log2(f / noteToHz(curNote)));
+   282→      if (semi < 0.85) {
+   283→        noteIdx[i] = curNote;
+   284→        continue;
+   285→      }
+   286→    }
+   287→    curNote = snapToNote(f);
+   288→    noteIdx[i] = curNote;
+   289→  }
+   290→
+   291→  // group consecutive frames into note runs (single-frame gaps tolerated)
+   292→  interface Run {
+   293→    note: number;
+   294→    start: number;
+   295→    end: number;
+   296→    len: number;
+   297→  }
+   298→  const runs: Run[] = [];
+   299→  let i = 0;
+   300→  while (i < frames) {
+   301→    if (noteIdx[i] === NO_NOTE) {
+   302→      i++;
+   303→      continue;
+   304→    }
+   305→    const note = noteIdx[i];
+   306→    let j = i;
+   307→    let len = 0;
+   308→    while (j < frames) {
+   309→      if (noteIdx[j] === note) {
+   310→        len++;
+   311→        j++;
+   312→      } else if (
+   313→        noteIdx[j] === NO_NOTE &&
+   314→        j + 1 < frames &&
+   315→        noteIdx[j + 1] === note
+   316→      ) {
+   317→        j++; // tolerate a single dropout frame inside the run
+   318→      } else {
+   319→        break;
+   320→      }
+   321→    }
+   322→    runs.push({ note, start: i, end: j, len });
+   323→    i = j;
+   324→  }
+   325→
+   326→  // which original notes actually occur, and which of them the removal
+   327→  // high-pass leaves audible. Slope-aware threshold: an N dB/oct
+   328→  // high-pass leaves a note at f roughly N·log2(cutoff/f) dB down, so a
+   329→  // note stays audible (≥ −18 dB, before the sidechain duck takes
+   330→  // another 6–12 dB) down to cutoff·2^(−18/N). The old fixed factor
+   331→  // (0.945 ≈ one semitone below the corner) ignored the slope: at
+   332→  // 48 dB/oct notes 2–4 semitones below the corner still passed at
+   333→  // −10…−25 dB, and at 12 dB/oct almost the whole bassline survived.
+   334→  // A sub note at (near-)unison with such a residual beats slowly
+   335→  // against it — the "two bass frequencies modulating" wobble.
+   336→  const AUDIBLE_RESIDUAL_DB = 18;
+   337→  const usedNotes = new Set<number>();
+   338→  for (const r of runs) if (r.len >= 2) usedNotes.add(r.note);
+   339→  const surviveThresh =
+   340→    cutoffHz *
+   341→    Math.pow(2, -AUDIBLE_RESIDUAL_DB / Math.max(12, removeSlopeDb));
+   342→  const surviving = new Set<number>();
+   343→  for (const n of usedNotes) {
+   344→    if (noteToHz(n) >= surviveThresh) surviving.add(n);
+   345→  }
+   346→
+   347→  // Line-level anti-collision guard: if the line's MEDIAN note still
+   348→  // lands in unison with a surviving original at this octave shift (a
+   349→  // manual cutoff that doesn't clear the line, or a bassline that
+   350→  // already sits inside the band), drop the whole line one more octave.
+   351→  // One consistent shift for every note — the previous per-note guard
+   352→  // moved individual colliding notes up octaves while their neighbours
+   353→  // stayed put, and the sub audibly "bounced" up and down through those
+   354→  // sections.
+   355→  const medNote = snapToNote(med);
+   356→  let kLine = kStar;
+   357→  while (kLine < 5 && surviving.has(medNote - 12 * kLine)) kLine++;
+   358→  kStar = kLine;
+   359→
+   360→  const targets = new Float32Array(frames);
+   361→  let minHz = Infinity;
+   362→  let maxHz = 0;
+   363→
+   364→  if (mode === "extreme") {
+   365→    /* Dominant-note sub: the median of the snapped notes in a ±1 s
+   366→     * window per frame, then a debounced switch (the new dominant must
+   367→     * hold ~0.4 s before the pitch moves). The sub sits on one steady
+   368→     * pitch per section, always inside the band, and pumps with the
+   369→     * track's own bass envelope — maximum pressure, and by design it
+   370→     * cannot bounce up and down octaves. */
+   371→    const W = Math.max(5, Math.round(1.0 / analysis.hopSec));
+   372→    const HOLD = Math.max(3, Math.round(0.4 / analysis.hopSec));
+   373→    const dom = new Int32Array(frames).fill(NO_NOTE);
+   374→    const vals: number[] = [];
+   375→    for (let i = 0; i < frames; i++) {
+   376→      vals.length = 0;
+   377→      for (let j = Math.max(0, i - W); j <= Math.min(frames - 1, i + W); j++) {
+   378→        if (noteIdx[j] !== NO_NOTE) vals.push(noteIdx[j]);
+   379→      }
+   380→      if (vals.length >= 3) {
+   381→        vals.sort((a, b) => a - b);
+   382→        dom[i] = vals[Math.floor(vals.length / 2)];
+   383→      }
+   384→    }
+   385→    // debounce: hold the current pitch until a different dominant note
+   386→    // has persisted for HOLD frames (≈0.4 s)
+   387→    let cur = NO_NOTE;
+   388→    let cand = NO_NOTE;
+   389→    let hold = 0;
+   390→    for (let i = 0; i < frames; i++) {
+   391→      const d = dom[i];
+   392→      if (cur === NO_NOTE && d !== NO_NOTE) {
+   393→        cur = d;
+   394→      } else if (d !== NO_NOTE && d !== cur) {
+   395→        if (d === cand) {
+   396→          hold++;
+   397→          if (hold >= HOLD) {
+   398→            cur = d;
+   399→            cand = NO_NOTE;
+   400→            hold = 0;
+   401→          }
+   402→        } else {
+   403→          cand = d;
+   404→          hold = 1;
+   405→        }
+   406→      } else if (d === cur) {
+   407→        cand = NO_NOTE;
+   408→        hold = 0;
+   409→      }
+   410→      if (cur !== NO_NOTE) {
+   411→        const hz = Math.min(high, Math.max(low, noteToHz(cur - 12 * kStar)));
+   412→        targets[i] = hz;
+   413→        if (hz < minHz) minHz = hz;
+   414→        if (hz > maxHz) maxHz = hz;
+   415→      }
+   416→    }
+   417→  } else {
+   418→    /* Calm melodic mapping: run-by-run targets like before, but every
+   419→     * note is held at or above the band floor. Notes that used to map
+   420→     * to 16–25 Hz (inaudible on almost any speaker, and the reason a
+   421→     * "29–34 Hz" rebass sounded like 20 Hz or less) now sit AT the
+   422→     * floor instead of sinking under it — no octave-fold jumps, just a
+   423→     * gentle floor. */
+   424→    let lastNote: number | null = null;
+   425→    for (const r of runs) {
+   426→      const runNote = r.len >= 2 ? r.note : lastNote;
+   427→      if (runNote !== null) {
+   428→        const hz = Math.max(low, noteToHz(runNote - 12 * kStar));
+   429→        for (let f = r.start; f < r.end; f++) targets[f] = hz;
+   430→        if (r.len >= 2) {
+   431→          lastNote = r.note;
+   432→          if (hz < minHz) minHz = hz;
+   433→          if (hz > maxHz) maxHz = hz;
+   434→        }
+   435→      }
+   436→    }
+   437→  }
+   438→  const subRange: [number, number] = maxHz > 0 ? [minHz, maxHz] : [0, 0];
+   439→
+   440→  // fill gaps between runs with the nearest run's frequency so the glide
+   441→  // never has to travel from silence
+   442→  let prev = 0;
+   443→  for (let f = 0; f < frames; f++) {
+   444→    if (targets[f] > 0) prev = targets[f];
+   445→    else targets[f] = prev;
+   446→  }
+   447→  // fill any remaining leading gap with the first mapped note
+   448→  let next = 0;
+   449→  for (let f = frames - 1; f >= 0; f--) {
+   450→    if (targets[f] > 0) next = targets[f];
+   451→    else if (next > 0) targets[f] = next;
+   452→  }
+   453→
+   454→  return {
+   455→    targets,
+   456→    octaveShift: kStar,
+   457→    noteCount: usedNotes.size,
+   458→    subRange,
+   459→  };
+   460→}
+   461→
+   462→/* ------------------------------------------------------------------ */
+   463→/* Main processor                                                       */
+   464→/* ------------------------------------------------------------------ */
+   465→
+   466→export async function processRebass(
+   467→  chs: Channels,
+   468→  fs: number,
+   469→  opts: RebassOptions,
+   470→  onProgress?: ProgressFn
+   471→): Promise<{ channels: Channels; info: RebassInfo }> {
+   472→  const low = Math.max(16, Math.min(opts.rangeLow, 200));
+   473→  const high = Math.max(low + 2, Math.min(opts.rangeHigh, 220));
+   474→  const N = chs[0].length;
+   475→
+   476→  /* ---------------- 1. analysis (cached) ---------------- */
+   477→  const cache = await getFileCache(chs, fs, onProgress);
+   478→  const analysis = cache.analysis;
+   479→  const frames = analysis.frames;
+   480→
+   481→  /* ---------------- 2. resolve the removal cutoff ---------------- */
+   482→  // "auto" clears the entire detected bassline: p90 of the pitch track
+   483→  // plus four semitones of transition-band margin (a 48 dB/oct
+   484→  // high-pass leaves a note AT the corner only −12 dB, and the previous
+   485→  // two-semitone margin left the top of the bassline just −8…−12 dB
+   486→  // down — still loud enough to beat against a sub at the same pitch;
+   487→  // +4 semitones pushes the p90 note to ~−27 dB), always at least the
+   488→  // top of the target band.
+   489→  let cutoffHz: number;
+   490→  if (opts.removeBelowHz === "auto") {
+   491→    const p90 = analysis.rangeF0[1];
+   492→    cutoffHz = Math.min(
+   493→      160,
+   494→      Math.max(high, p90 > 0 ? p90 * 1.26 : 0, 30)
+   495→    );
+   496→  } else {
+   497→    cutoffHz = Math.max(16, Math.min(opts.removeBelowHz, 250));
+   498→  }
+   499→
+   500→  /* ---------------- 3. transcribe to notes ---------------- */
+   501→  if (onProgress) await onProgress(0.52, "Mapping bassline");
+   502→  const { targets, octaveShift, noteCount, subRange } = mapBasslineNotes(
+   503→    analysis,
+   504→    low,
+   505→    high,
+   506→    cutoffHz,
+   507→    opts.removeSlope,
+   508→    opts.mode
+   509→  );
+   510→
+   511→  // per-frame amplitude target (0..1), normalized so p95 of active = 1.
+   512→  // The gate uses hysteresis (5 dB) and bridges single-frame pitch
+   513→  // dropouts so the sub never stutters when the level or the pitch
+   514→  // confidence hovers around the gate boundary.
+   515→  const envLin = new Float32Array(frames);
+   516→  const envDb = analysis.envDb;
+   517→  const nEnv = Math.min(frames, envDb.length);
+   518→  let gateOn = false;
+   519→  for (let f = 0; f < frames; f++) {
+   520→    const envOk =
+   521→      f < nEnv && envDb[f] > (gateOn ? cache.gateDb - 5 : cache.gateDb);
+   522→    let pitchOk = analysis.f0[f] > 0;
+   523→    if (!pitchOk && f > 0 && f + 1 < frames) {
+   524→      pitchOk = analysis.f0[f - 1] > 0 && analysis.f0[f + 1] > 0;
+   525→    }
+   526→    gateOn = envOk && pitchOk;
+   527→    envLin[f] =
+   528→      gateOn && f < nEnv
+   529→        ? Math.min(1, dbToGain(Math.min(0, envDb[f] - cache.envMax)))
+   530→        : 0;
+   531→  }
+   532→  const activeVals: number[] = [];
+   533→  for (let f = 0; f < frames; f++) {
+   534→    if (envLin[f] > 0.02) activeVals.push(envLin[f]);
+   535→  }
+   536→  activeVals.sort((a, b) => a - b);
+   537→  const p95 =
+   538→    activeVals.length > 0
+   539→      ? activeVals[Math.floor(activeVals.length * 0.95)]
+   540→      : 1;
+   541→  const norm = p95 > 0.001 ? 1 / p95 : 1;
+   542→  for (let f = 0; f < frames; f++) {
+   543→    envLin[f] = Math.min(1.15, envLin[f] * norm);
+   544→  }
+   545→
+   546→  /* ---------------- 4. synthesize the sub ---------------- */
+   547→  if (onProgress) await onProgress(0.58, "Forging sub-bass");
+   548→  const sub = new Float32Array(N);
+   549→  // sub presence 0..1 per sample (pre-gain) — drives the sidechain duck
+   550→  const envTrack = new Float32Array(N);
+   551→  const hopSamples = analysis.hopSec * fs;
+   552→  // frame f's estimates describe the CENTER of its analysis window
+   553→  // [f·hop, f·hop + 2·centerOffset]. Driving the synth at the window
+   554→  // start instead made every note change and envelope movement land
+   555→  // roughly half a window (~128 ms) before the actual note.
+   556→  const centerSamples = analysis.centerOffsetSec * fs;
+   557→  // Note-confirmation delay. Even window-centered, a frame can report a
+   558→  // NEW note before its true onset: the 256 ms window straddles the
+   559→  // change, and when the old note's tail is quiet the attack transient
+   560→  // alone can dominate the autocorrelation — the detected switch then
+   561→  // lands up to ~100 ms early and the sub changed pitch before the
+   562→  // original bass did. Consuming every frame ~1.5 hops later holds the
+   563→  // sub on the old note until the new one is genuinely there (the
+   564→  // portamento glide adds its own few ms on top, so the switch lands
+   565→  // on the beat, never ahead of it).
+   566→  const confirmSamples = Math.min(0.12, analysis.hopSec * 1.5) * fs;
+   567→
+   568→  const times = FOLLOW_TIMES[opts.follow];
+   569→  // attack/release never shorter than a fraction of the sub period —
+   570→  // faster envelopes amplitude-modulate deep notes and sound shaky
+   571→  const periodSec = 1 / Math.max(1, low);
+   572→  const atkSec = Math.max(times.atk, periodSec * 0.5);
+   573→  const relSec = Math.max(times.rel, periodSec * 2);
+   574→  const atkCoef = Math.exp(-1 / (fs * atkSec));
+   575→  const relCoef = Math.exp(-1 / (fs * relSec));
+   576→  const glideCoef = Math.exp(-1 / (fs * times.glide));
+   577→
+   578→  let logF = Math.log(low);
+   579→  let envState = 0;
+   580→  let phase = 0;
+   581→  let subActive = 0;
+   582→  let lastYield = 0;
+   583→  // cached while the frequency is steady — avoids two Math calls per sample
+   584→  let fCur = low;
+   585→  let inc = (2 * Math.PI * fCur) / fs;
+   586→
+   587→  for (let n = 0; n < N; n++) {
+   588→    const fpos = Math.max(0, (n - centerSamples - confirmSamples) / hopSamples);
+   589→    const i0 = Math.min(frames - 1, Math.floor(fpos));
+   590→    const i1 = Math.min(frames - 1, i0 + 1);
+   591→    const fr = fpos - i0;
+   592→
+   593→    // glide toward the current note (log-domain portamento). exp() is only
+   594→    // needed while the glide is actually converging
+   595→    const ta = targets[i0];
+   596→    const tb = targets[i1];
+   597→    let hz = 0;
+   598→    if (ta > 0 && tb > 0) hz = ta + (tb - ta) * fr;
+   599→    else if (ta > 0) hz = ta;
+   600→    else if (tb > 0) hz = tb;
+   601→    if (hz > 0) {
+   602→      const delta = (Math.log(hz) - logF) * (1 - glideCoef);
+   603→      if (delta !== 0) {
+   604→        logF += delta;
+   605→        if (Math.abs(delta) > 1e-10) {
+   606→          fCur = Math.min(1000, Math.exp(logF));
+   607→          inc = (2 * Math.PI * fCur) / fs;
+   608→        }
+   609→      }
+   610→    }
+   611→
+   612→    // smooth per-sample envelope
+   613→    const ampT = envLin[i0] + (envLin[i1] - envLin[i0]) * fr;
+   614→    envState =
+   615→      ampT > envState
+   616→        ? atkCoef * envState + (1 - atkCoef) * ampT
+   617→        : relCoef * envState + (1 - relCoef) * ampT;
+   618→
+   619→    phase += inc;
+   620→    if (phase >= 2 * Math.PI) phase -= 2 * Math.PI;
+   621→
+   622→    sub[n] = synthWaveform(phase, opts.waveform) * envState;
+   623→    envTrack[n] = envState;
+   624→    if (envState > 0.02) subActive++;
+   625→
+   626→    if (onProgress && (n & 0x1fffff) === 0 && n - lastYield > 900000) {
+   627→      lastYield = n;
+   628→      await onProgress(0.58 + (n / N) * 0.12, "Forging sub-bass");
+   629→    }
+   630→  }
+   631→
+   632→  // scale sub level relative to the original bass loudness, with a peak
+   633→  // cap that keeps the limiter from riding the sub's own cycles
+   634→  let subRms = 0;
+   635→  for (let n = 0; n < N; n++) subRms += sub[n] * sub[n];
+   636→  subRms = Math.sqrt(subRms / Math.max(1, N));
+   637→  const targetRms = cache.bassRms * dbToGain(opts.subLevelDb);
+   638→  let subGain = subRms > 1e-6 ? targetRms / subRms : 0;
+   639→  const subPeakPre = truePeak([sub]);
+   640→  const cap = dbToGain(SUB_PEAK_CAP_DB);
+   641→  if (subPeakPre * subGain > cap) subGain = cap / Math.max(subPeakPre, 1e-6);
+   642→  for (let n = 0; n < N; n++) sub[n] *= subGain;
+   643→  const subPeakDb = gainToDb(truePeak([sub]));
+   644→
+   645→  /* ---------------- 5. remove original bass + mix ---------------- */
+   646→  if (onProgress) await onProgress(0.72, "Removing original bass");
+   647→  const cascades = Math.max(1, Math.round(opts.removeSlope / 12));
+   648→  const hpKey = `${Math.round(cutoffHz * 10)}|${opts.removeSlope}`;
+   649→  let dry: Channels;
+   650→  if (cache.hpKey === hpKey && cache.hpChannels) {
+   651→    dry = cache.hpChannels;
+   652→  } else {
+   653→    dry = await filterChannels(
+   654→      chs,
+   655→      fs,
+   656→      { type: "highpass", freq: cutoffHz },
+   657→      cascades
+   658→    );
+   659→    cache.hpKey = hpKey;
+   660→    cache.hpChannels = dry;
+   661→  }
+   662→  // Sidechain duck: while the sub sounds, the original's low band dips so
+   663→  // the layers never fight (deeper dip when the sub is set louder:
+   664→  // subLevelDb −12…+12 → 6…12 dB).
+   665→  const duckDbAmt =
+   666→    6 + 6 * Math.min(1, Math.max(0, (opts.subLevelDb + 12) / 12));
+   667→  const duckDepth = 1 - dbToGain(-duckDbAmt);
+   668→  const duckHz = Math.min(
+   669→    180,
+   670→    Math.max(90, Math.max(low, cutoffHz) * 3)
+   671→  );
+   672→  // Linkwitz-Riley split (2 cascaded biquads per side = LR4): the low and
+   673→  // high paths sum back to an allpass — flat magnitude, no phase-boost
+   674→  // artefacts — so the gain applied to the low path is exact at every
+   675→  // frequency. (Subtracting a lowpassed copy instead would boost
+   676→  // frequencies where the filter's phase lag turns subtraction into
+   677→  // addition.)
+   678→  const lowPath = await filterChannels(
+   679→    dry,
+   680→    fs,
+   681→    { type: "lowpass", freq: duckHz },
+   682→    2
+   683→  );
+   684→  const highPath = await filterChannels(
+   685→    dry,
+   686→    fs,
+   687→    { type: "highpass", freq: duckHz },
+   688→    2
+   689→  );
+   690→
+   691→  // highPath is a fresh copy we own — accumulate the ducked low band and
+   692→  // the sub straight into it
+   693→  const out = highPath;
+   694→  for (let c = 0; c < out.length; c++) {
+   695→    const ch = out[c];
+   696→    const lp = lowPath[c];
+   697→    for (let n = 0; n < N; n++) {
+   698→      const duck = Math.min(1, envTrack[n]);
+   699→      ch[n] += lp[n] * (1 - duckDepth * duck) + sub[n];
+   700→    }
+   701→  }
+   702→
+   703→  /* ---------------- 5. limiter ---------------- */
+   704→  // long release + long lookahead: the gain change per sub cycle stays
+   705→  // tiny, so the low end never trembles even when the limiter is working
+   706→  if (onProgress) await onProgress(0.85, "Limiting");
+   707→  const limiter = await limitChannels(out, fs, {
+   708→    ceilingDb: -0.3,
+   709→    lookaheadMs: 12,
+   710→    releaseMs: 300,
+   711→    onProgress: async (f) => {
+   712→      if (onProgress) await onProgress(0.85 + f * 0.15, "Limiting");
+   713→    },
+   714→  });
+   715→
+   716→  /* ---------------- 6. stats ---------------- */
+   717→  const info: RebassInfo = {
+   718→    analysis,
+   719→    cutoffHz,
+   720→    subRangeHz: subRange,
+   721→    subActivePct: N > 0 ? (subActive / N) * 100 : 0,
+   722→    octaveShift,
+   723→    subPeakDb,
+   724→    limiter,
+   725→    lowConfidence: cache.lowConfidence,
+   726→    noteCount,
+   727→  };
+   728→  if (onProgress) await onProgress(1);
+   729→  return { channels: out, info };
+   730→}
+   731→
+   732→/** helper for tools that just need a mono reference quickly */
+   733→export function monoReference(chs: Channels): Float32Array {
+   734→  return mixdown(chs);
+   735→}
+   736→
+   737→export function rebassDefaults(): RebassOptions {
+   738→  return {
+   739→    rangeLow: 29,
+   740→    rangeHigh: 34,
+   741→    removeBelowHz: "auto",
+   742→    removeSlope: 48,
+   743→    subLevelDb: 6,
+   744→    waveform: "saturated",
+   745→    follow: "fast",
+   746→    mode: "extreme",
+   747→  };
+   748→}
+   749→
+   750→export { copyChannels };
+   751→
