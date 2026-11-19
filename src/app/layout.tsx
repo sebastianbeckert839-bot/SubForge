@@ -51,12 +51,14 @@ export const metadata: Metadata = {
     siteName: "SubForge",
     type: "website",
     url: "/",
+    images: [{ url: "/og.png", width: 1200, height: 630, alt: "SubForge — free online rebasser and audio tools" }],
   },
   twitter: {
     card: "summary_large_image",
     title: "SubForge — Online Rebasser & Free Audio Tools",
     description:
       "Rebass any song into a custom sub band, boost bass +15 dB, and much more. Free, no uploads.",
+    images: ["/og.png"],
   },
   robots: {
     index: true,
@@ -84,7 +86,7 @@ function structuredData(): string {
         description: t.description,
         applicationCategory: "MultimediaApplication",
         operatingSystem: "Any (browser)",
-        url: `${SITE_URL}/#/tool/${t.id}`,
+        url: `${SITE_URL}/?tool=${t.id}`,
         offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
       },
     })),

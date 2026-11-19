@@ -1,8 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Play, Pause, RotateCcw, Clapperboard, Square, Film } from "lucide-react";
+import {
+  Play,
+  Pause,
+  RotateCcw,
+  Clapperboard,
+  Square,
+  Film,
+  ImagePlus,
+  Trash2,
+  Move,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -28,10 +38,17 @@ import {
   videoDims,
   DEFAULT_SETTINGS,
   STYLE_PRESETS,
+  BETTER_PRESETS,
+  FONT_OPTIONS,
+  defaultVizPos,
+  fontFamily,
   type VizSettings,
   type VizPreset,
   type ColorMode,
   type VizFormat,
+  type TextFont,
+  type TextAlign,
+  type VizRenderState,
 } from "@/lib/visualizer/render";
 
 /* ------------------------------------------------------------------ */
@@ -54,7 +71,7 @@ function pickMime(): { mime: string; ext: string } {
 }
 
 /* ------------------------------------------------------------------ */
-/* Color input row                                                     */
+/* Shared small helpers                                                */
 /* ------------------------------------------------------------------ */
 
 function ColorRow({
@@ -95,6 +112,70 @@ function ColorRow({
   );
 }
 
+/** upload button + hidden file input + optional clear button */
+function ImageUploadRow({
+  label,
+  hasImage,
+  onPick,
+  onClear,
+  hint,
+}: {
+  label: string;
+  hasImage: boolean;
+  onPick: (dataUrl: string) => void;
+  onClear: () => void;
+  hint?: string;
+}) {
+  const id = useId();
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <label className="text-sm font-medium" htmlFor={id}>
+          {label}
+        </label>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" asChild>
+            <label htmlFor={id} className="cursor-pointer">
+              <ImagePlus className="size-3.5" />
+              Upload
+            </label>
+          </Button>
+          {hasImage ? (
+            <Button variant="ghost" size="sm" onClick={onClear}>
+              <Trash2 className="size-3.5" />
+              Clear
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      <input
+        id={id}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          e.target.value = "";
+          if (!f) return;
+          if (f.size > 15 * 1024 * 1024) {
+            toast.error("Image too large — keep it under 15 MB.");
+            return;
+          }
+          const r = new FileReader();
+          r.onload = () => {
+            if (typeof r.result === "string") onPick(r.result);
+          };
+          r.onerror = () => toast.error("Could not read that image.");
+          r.readAsDataURL(f);
+        }}
+      />
+      {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
+    </div>
+  );
+}
+
+const clamp01 = (v: number) => Math.max(0.02, Math.min(0.98, v));
+
 /* ------------------------------------------------------------------ */
 /* The tool                                                            */
 /* ------------------------------------------------------------------ */
@@ -103,6 +184,44 @@ interface ExportState {
   running: boolean;
   progress: number;
 }
+
+type DragMode = "off" | "text" | "viz";
+
+const BG_CHIPS: { label: string; url: string | null }[] = [
+  { label: "None", url: null },
+  { label: "Skyline", url: "/viz/bg-skyline.jpg" },
+  { label: "Dusk Ridge", url: "/viz/bg-ridge.jpg" },
+  { label: "Neon City", url: "/viz/bg-neon.jpg" },
+  { label: "Vortex", url: "/viz/bg-vortex.jpg" },
+  { label: "Album art (blurred)", url: "use-center" },
+];
+
+const TEXT_LAYOUTS: { label: string; apply: (s: VizSettings) => VizSettings }[] = [
+  {
+    label: "Center",
+    apply: (s) => ({ ...s, textPos: { x: 0.5, y: 0.4 }, align: "center" }),
+  },
+  {
+    label: "Lower center",
+    apply: (s) => ({ ...s, textPos: { x: 0.5, y: 0.76 }, align: "center" }),
+  },
+  {
+    label: "Lower left",
+    apply: (s) => ({ ...s, textPos: { x: 0.08, y: 0.76 }, align: "left" }),
+  },
+  {
+    label: "Top",
+    apply: (s) => ({ ...s, textPos: { x: 0.5, y: 0.07 }, align: "center" }),
+  },
+  {
+    label: "Left side",
+    apply: (s) => ({ ...s, textPos: { x: 0.08, y: 0.44 }, align: "left" }),
+  },
+  {
+    label: "Auto",
+    apply: (s) => ({ ...s, textPos: { x: 0.5, y: -1 }, align: "center" }),
+  },
+];
 
 export default function VisualizerTool() {
   const { channels, fs, meta, baseName } = useAudioStore();
@@ -118,6 +237,10 @@ export default function VisualizerTool() {
     progress: 0,
   });
   const [activeStyle, setActiveStyle] = useState<string>("forge");
+  const [activeBetter, setActiveBetter] = useState<string>("none");
+  const [dragMode, setDragMode] = useState<DragMode>("off");
+  const [activeLayout, setActiveLayout] = useState<string | undefined>();
+  const [activeBgChip, setActiveBgChip] = useState<string | undefined>();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const settingsRef = useRef(settings);
@@ -133,6 +256,16 @@ export default function VisualizerTool() {
   const cancelExportRef = useRef(false);
   const posRef = useRef(0);
   const lastPosUiRef = useRef(0);
+  const draggingRef = useRef(false);
+
+  // decoded images + per-canvas render state (bass smoothing, particles)
+  const bgImgRef = useRef<HTMLImageElement | null>(null);
+  const centerImgRef = useRef<HTMLImageElement | null>(null);
+  const vizStateRef = useRef<VizRenderState>({
+    bass: 0,
+    parts: new Float32Array(0),
+    partCount: 0,
+  });
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -156,6 +289,73 @@ export default function VisualizerTool() {
   }, [dims]);
 
   const duration = meta?.durationSec ?? 0;
+
+  /* --------------------- image + font loading ---------------------- */
+
+  // display fonts for the text overlays — injected dynamically so nothing
+  // render-blocks, and only when the visualizer is actually used. If the
+  // font can't load, the canvas quietly falls back to system-ui.
+  useEffect(() => {
+    if (document.getElementById("subforge-viz-fonts")) return;
+    const l = document.createElement("link");
+    l.id = "subforge-viz-fonts";
+    l.rel = "stylesheet";
+    l.href =
+      "https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Caveat:wght@700&family=Montserrat:wght@400;700;800&family=Oswald:wght@500;600&family=Playfair+Display:wght@700&family=Space+Grotesk:wght@500;700&display=swap";
+    document.head.appendChild(l);
+  }, []);
+
+  useEffect(() => {
+    const url =
+      settings.bgImage && settings.bgImage !== "use-center" ? settings.bgImage : null;
+    if (!url) {
+      bgImgRef.current = null;
+      return;
+    }
+    let alive = true;
+    const img = new Image();
+    img.onload = () => {
+      if (alive) bgImgRef.current = img;
+    };
+    img.onerror = () => {
+      if (alive) bgImgRef.current = null;
+    };
+    img.src = url;
+    return () => {
+      alive = false;
+    };
+  }, [settings.bgImage]);
+
+  useEffect(() => {
+    if (!settings.centerImage) {
+      centerImgRef.current = null;
+      return;
+    }
+    let alive = true;
+    const img = new Image();
+    img.onload = () => {
+      if (alive) centerImgRef.current = img;
+    };
+    img.onerror = () => {
+      if (alive) centerImgRef.current = null;
+    };
+    img.src = settings.centerImage;
+    return () => {
+      alive = false;
+    };
+  }, [settings.centerImage]);
+
+  // make sure the selected display font is actually loaded before the
+  // canvas tries to draw with it (falls back to system-ui meanwhile)
+  useEffect(() => {
+    if (typeof document === "undefined" || !document.fonts) return;
+    void document.fonts
+      .load(`800 32px ${fontFamily(settings.font)}`)
+      .catch(() => {});
+    void document.fonts
+      .load(`700 32px ${fontFamily(settings.font)}`)
+      .catch(() => {});
+  }, [settings.font]);
 
   /* --------------------------- playback ---------------------------- */
 
@@ -266,11 +466,13 @@ export default function VisualizerTool() {
         progress: duration > 0 ? posRef.current / duration : 0,
         peaks: peaksRef.current,
         dt,
+        bgImg: bgImgRef.current,
+        centerImg: centerImgRef.current,
+        state: vizStateRef.current,
       });
     };
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
-     
   }, [fs, duration]);
 
   // cleanup on unmount / file change
@@ -298,6 +500,25 @@ export default function VisualizerTool() {
     const p = STYLE_PRESETS.find((x) => x.id === id);
     if (!p) return;
     setActiveStyle(id);
+    setActiveBetter("none");
+    setSettings((s) => ({ ...s, ...p.settings }));
+  }, []);
+
+  const applyBetterPreset = useCallback((id: string) => {
+    const p = BETTER_PRESETS.find((x) => x.id === id);
+    if (!p) return;
+    setActiveBetter(id);
+    setActiveStyle("");
+    setActiveLayout(undefined);
+    setActiveBgChip(
+      p.settings.bgImage === undefined
+        ? undefined
+        : p.settings.bgImage === null
+          ? "None"
+          : p.settings.bgImage === "use-center"
+            ? "Album art (blurred)"
+            : BG_CHIPS.find((c) => c.url === p.settings.bgImage)?.label
+    );
     setSettings((s) => ({ ...s, ...p.settings }));
   }, []);
 
@@ -309,6 +530,7 @@ export default function VisualizerTool() {
   };
 
   const seek = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (dragMode !== "off") return;
     if (duration <= 0) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -319,6 +541,30 @@ export default function VisualizerTool() {
       posRef.current = target;
       setPosition(target);
     }
+  };
+
+  /* ----------------------- drag to position ------------------------ */
+
+  const enableDrag = (mode: DragMode) => {
+    setDragMode(mode);
+    if (mode === "text") {
+      // materialize the auto position so the first drag starts from it
+      setSettings((s) =>
+        s.textPos.y < 0 ? { ...s, textPos: { x: 0.5, y: 0.76 } } : s
+      );
+    } else if (mode === "viz") {
+      setSettings((s) =>
+        s.vizPos.y < 0 ? { ...s, vizPos: defaultVizPos(s.preset) } : s
+      );
+    }
+  };
+
+  const dragTo = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = clamp01((e.clientX - rect.left) / rect.width);
+    const y = clamp01((e.clientY - rect.top) / rect.height);
+    if (dragMode === "text") set("textPos", { x, y });
+    else if (dragMode === "viz") set("vizPos", { x, y });
   };
 
   /* --------------------------- export ------------------------------ */
@@ -360,7 +606,9 @@ export default function VisualizerTool() {
 
       const freq = new Uint8Array(analyser.frequencyBinCount);
       const time = new Uint8Array(analyser.fftSize);
-      const peaks = new Float32Array(s.preset === "wave" ? 0 : s.barCount);
+      const peaks = new Float32Array(0);
+      // fresh render state so particles/bass don't carry over from preview
+      const state: VizRenderState = { bass: 0, parts: new Float32Array(0), partCount: 0 };
 
       const stream = canvas.captureStream(s.fps);
       for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
@@ -407,6 +655,9 @@ export default function VisualizerTool() {
             progress: totalSec > 0 ? elapsed / totalSec : 0,
             peaks,
             dt,
+            bgImg: bgImgRef.current,
+            centerImg: centerImgRef.current,
+            state,
           });
           if (ts - lastUi > 250) {
             lastUi = ts;
@@ -461,19 +712,50 @@ export default function VisualizerTool() {
 
   /* --------------------------- render ------------------------------ */
 
-  const isBarPreset =
-    settings.preset === "bars" || settings.preset === "mirror" || settings.preset === "radial";
+  const barLike = [
+    "bars",
+    "mirror",
+    "radial",
+    "hanging",
+    "flank",
+    "lines",
+  ].includes(settings.preset);
+  const hasCenterArt =
+    settings.preset === "blob" || settings.preset === "flank" || settings.preset === "lines";
 
   return (
     <ToolPage toolId="visualizer" wide>
       <ToolGrid>
         <div className="flex flex-col gap-6">
+          {/* ---------------- Better Visualizers ---------------- */}
+          <ControlsCard
+            title="Better Visualizers"
+            description="The premium looks — photo backgrounds, floating particles, bass-reactive blur, custom fonts and draggable layout. Pick one, then tune literally everything below."
+          >
+            <SelectRow<string>
+              label="Premium style"
+              value={activeBetter}
+              onChange={(v) => {
+                if (v !== "none") applyBetterPreset(v);
+              }}
+              options={[
+                { value: "none", label: "Choose a style…" },
+                ...BETTER_PRESETS.map((p) => ({ value: p.id, label: p.label })),
+              ]}
+            />
+            <p className="text-xs text-muted-foreground">
+              Every premium style needs your music playing to come alive — press
+              play in the preview and watch the background pump with the bass.
+            </p>
+          </ControlsCard>
+
+          {/* ---------------- classic styles ---------------- */}
           <ControlsCard
             title="Style presets"
-            description="Ten looks, one click each — then tweak anything below."
+            description="Ten classic looks, one click each — then tweak anything below."
           >
             <PresetChips
-              presets={STYLE_PRESETS.map((p) => ({
+              presets={STYLE_PRESETS.filter((p) => !p.premium).map((p) => ({
                 label: p.label,
                 apply: () => applyStylePreset(p.id),
               }))}
@@ -482,13 +764,20 @@ export default function VisualizerTool() {
             <SelectRow<VizPreset>
               label="Visualizer type"
               value={settings.preset}
-              onChange={(v) => set("preset", v)}
+              onChange={(v) => {
+                setActiveBetter("none");
+                set("preset", v);
+              }}
               options={[
                 { value: "bars", label: "Frequency bars" },
                 { value: "mirror", label: "Mirror bars" },
                 { value: "radial", label: "Radial ring" },
                 { value: "freq-wave", label: "Frequency wave (spectrum curve)" },
                 { value: "wave", label: "Waveform (oscilloscope)" },
+                { value: "hanging", label: "Hanging wave — premium" },
+                { value: "flank", label: "Flank bars — premium" },
+                { value: "lines", label: "Flank lines — premium" },
+                { value: "blob", label: "Liquid blob — premium" },
               ]}
             />
             <SelectRow<ColorMode>
@@ -513,7 +802,6 @@ export default function VisualizerTool() {
               onChange={(v) => set("color2", v)}
               disabled={settings.colorMode === "solid" || settings.colorMode === "rainbow"}
             />
-            <ColorRow label="Background" value={settings.bg} onChange={(v) => set("bg", v)} />
             <SliderRow
               label="Glow"
               value={settings.glow}
@@ -525,40 +813,281 @@ export default function VisualizerTool() {
             />
           </ControlsCard>
 
+          {/* ---------------- background & atmosphere ---------------- */}
+          <ControlsCard
+            title="Background & atmosphere"
+            description="Any photo behind the visuals — blurred, darkened, and pumping with the bass."
+          >
+            <ColorRow label="Fallback color" value={settings.bg} onChange={(v) => set("bg", v)} />
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-medium">Background image</label>
+              <PresetChips
+                presets={BG_CHIPS.map((c) => ({
+                  label: c.label,
+                  apply: () => {
+                    setActiveBgChip(c.label);
+                    set("bgImage", c.url);
+                  },
+                }))}
+                active={activeBgChip}
+              />
+            </div>
+            <ImageUploadRow
+              label="Your own image"
+              hasImage={
+                !!settings.bgImage &&
+                settings.bgImage !== "use-center" &&
+                !settings.bgImage.startsWith("/viz/")
+              }
+              onPick={(url) => {
+                setActiveBgChip(undefined);
+                set("bgImage", url);
+              }}
+              onClear={() => {
+                setActiveBgChip("None");
+                set("bgImage", null);
+              }}
+              hint="JPG / PNG / WebP — stays on your device"
+            />
+            <SliderRow
+              label="Blur"
+              value={settings.bgBlur}
+              min={0}
+              max={60}
+              step={1}
+              onChange={(v) => set("bgBlur", Math.round(v))}
+              format={(v) => `${Math.round(v)} px`}
+            />
+            <SliderRow
+              label="Darken"
+              value={settings.bgDark}
+              min={0}
+              max={0.9}
+              step={0.02}
+              onChange={(v) => set("bgDark", v)}
+              format={(v) => `${Math.round(v * 100)}%`}
+            />
+            <SliderRow
+              label="Bass pulse"
+              value={settings.bgBass}
+              min={0}
+              max={1}
+              step={0.05}
+              onChange={(v) => set("bgBass", v)}
+              format={(v) => `${Math.round(v * 100)}%`}
+              hint="On heavy bass the background gets darker and blurrier for a beat"
+            />
+            <SliderRow
+              label="Vignette"
+              value={settings.vignette}
+              min={0}
+              max={1}
+              step={0.05}
+              onChange={(v) => set("vignette", v)}
+              format={(v) => `${Math.round(v * 100)}%`}
+              hint="Cinematic dark edges"
+            />
+            <SliderRow
+              label="Floating particles"
+              value={settings.particles}
+              min={0}
+              max={140}
+              step={5}
+              onChange={(v) => set("particles", Math.round(v))}
+              format={(v) => `${Math.round(v)}`}
+            />
+            <SliderRow
+              label="Particle speed"
+              value={settings.particleSpeed}
+              min={0.2}
+              max={3}
+              step={0.1}
+              onChange={(v) => set("particleSpeed", v)}
+              format={(v) => `${v.toFixed(1)}×`}
+              disabled={settings.particles === 0}
+            />
+          </ControlsCard>
+
+          {/* ---------------- text & layout ---------------- */}
+          <ControlsCard
+            title="Text & layout"
+            description="Artist and title, any font, anywhere on the frame — drag it or use the layout chips."
+          >
+            <ToggleRow
+              label="Show title"
+              checked={settings.showTitle}
+              onChange={(v) => set("showTitle", v)}
+            />
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-medium">Title text</label>
+              <Input
+                value={settings.titleText}
+                onChange={(e) => set("titleText", e.target.value)}
+                placeholder={baseName || "Track title"}
+                maxLength={80}
+                aria-label="Title text"
+                disabled={!settings.showTitle}
+              />
+            </div>
+            <ToggleRow
+              label="Show artist"
+              description="Turn off for just one big song-name box"
+              checked={settings.showArtist}
+              onChange={(v) => set("showArtist", v)}
+            />
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-medium">Artist text</label>
+              <Input
+                value={settings.artistText}
+                onChange={(e) => set("artistText", e.target.value)}
+                placeholder="Artist name"
+                maxLength={80}
+                aria-label="Artist text"
+                disabled={!settings.showArtist}
+              />
+            </div>
+            <SelectRow<TextFont>
+              label="Font"
+              value={settings.font}
+              onChange={(v) => set("font", v)}
+              options={FONT_OPTIONS.map((f) => ({ value: f.value, label: f.label }))}
+            />
+            <SliderRow
+              label="Title size"
+              value={settings.titleScale}
+              min={0.4}
+              max={3}
+              step={0.05}
+              onChange={(v) => set("titleScale", v)}
+              format={(v) => `${v.toFixed(2)}×`}
+            />
+            <SliderRow
+              label="Artist size"
+              value={settings.artistScale}
+              min={0.4}
+              max={3}
+              step={0.05}
+              onChange={(v) => set("artistScale", v)}
+              format={(v) => `${v.toFixed(2)}×`}
+              disabled={!settings.showArtist}
+            />
+            <ToggleRow
+              label="ALL CAPS"
+              checked={settings.textUppercase}
+              onChange={(v) => set("textUppercase", v)}
+            />
+            <ColorRow label="Text color" value={settings.textColor} onChange={(v) => set("textColor", v)} />
+            <SelectRow<TextAlign>
+              label="Text alignment"
+              value={settings.align}
+              onChange={(v) => set("align", v)}
+              options={[
+                { value: "center", label: "Center" },
+                { value: "left", label: "Left" },
+                { value: "right", label: "Right" },
+              ]}
+            />
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-medium">Text position</label>
+              <PresetChips
+                presets={TEXT_LAYOUTS.map((l) => ({
+                  label: l.label,
+                  apply: () => {
+                    setActiveLayout(l.label);
+                    setSettings((s) => l.apply(s));
+                  },
+                }))}
+                active={activeLayout}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-medium">Drag on the preview</label>
+              <div className="flex gap-2">
+                {(
+                  [
+                    { v: "off", label: "Off" },
+                    { v: "text", label: "Move text" },
+                    { v: "viz", label: "Move visualizer" },
+                  ] as { v: DragMode; label: string }[]
+                ).map((o) => (
+                  <Button
+                    key={o.v}
+                    size="sm"
+                    variant={dragMode === o.v ? "default" : "outline"}
+                    onClick={() => enableDrag(o.v)}
+                    aria-pressed={dragMode === o.v}
+                  >
+                    {o.v !== "off" ? <Move className="size-3.5" /> : null}
+                    {o.label}
+                  </Button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                While a move mode is on, drag anywhere on the canvas — click-to-seek
+                comes back when you switch it off.
+              </p>
+            </div>
+            <ToggleRow
+              label="Show progress bar"
+              description="Thin bar at the bottom that fills with the track"
+              checked={settings.showProgress}
+              onChange={(v) => set("showProgress", v)}
+            />
+          </ControlsCard>
+
+          {/* ---------------- shape & motion ---------------- */}
           <ControlsCard title="Shape & motion" description="Everything updates live in the preview.">
-            {isBarPreset ? (
+            {barLike ? (
               <>
                 <SliderRow
-                  label={settings.preset === "radial" ? "Bars in the ring" : "Number of bars"}
+                  label={
+                    settings.preset === "radial"
+                      ? "Bars in the ring"
+                      : settings.preset === "lines"
+                        ? "Lines per side"
+                        : "Number of bars"
+                  }
                   value={settings.barCount}
-                  min={8}
-                  max={settings.preset === "radial" ? 240 : 200}
+                  min={settings.preset === "lines" ? 20 : 8}
+                  max={
+                    settings.preset === "radial"
+                      ? 240
+                      : settings.preset === "lines"
+                        ? 120
+                        : 200
+                  }
                   step={1}
                   onChange={(v) => set("barCount", Math.round(v))}
                   format={(v) => `${Math.round(v)}`}
                 />
-                <SliderRow
-                  label="Bar gap"
-                  value={settings.barGap}
-                  min={0}
-                  max={0.8}
-                  step={0.01}
-                  onChange={(v) => set("barGap", v)}
-                  format={(v) => `${Math.round(v * 100)}%`}
-                />
-                <ToggleRow
-                  label="Rounded bars"
-                  checked={settings.roundedBars}
-                  onChange={(v) => set("roundedBars", v)}
-                />
-                <ToggleRow
-                  label="Peak caps"
-                  description="Floating dots that mark each bar's recent peak"
-                  checked={settings.capDots}
-                  onChange={(v) => set("capDots", v)}
-                />
+                {settings.preset !== "lines" ? (
+                  <SliderRow
+                    label="Bar gap"
+                    value={settings.barGap}
+                    min={0}
+                    max={0.8}
+                    step={0.01}
+                    onChange={(v) => set("barGap", v)}
+                    format={(v) => `${Math.round(v * 100)}%`}
+                  />
+                ) : null}
+                {settings.preset !== "lines" ? (
+                  <ToggleRow
+                    label="Rounded bars"
+                    checked={settings.roundedBars}
+                    onChange={(v) => set("roundedBars", v)}
+                  />
+                ) : null}
+                {settings.preset === "bars" || settings.preset === "mirror" ? (
+                  <ToggleRow
+                    label="Peak caps"
+                    description="Floating dots that mark each bar's recent peak"
+                    checked={settings.capDots}
+                    onChange={(v) => set("capDots", v)}
+                  />
+                ) : null}
               </>
-            ) : (
+            ) : settings.preset === "freq-wave" || settings.preset === "wave" ? (
               <SliderRow
                 label="Line width"
                 value={settings.lineWidth}
@@ -568,7 +1097,7 @@ export default function VisualizerTool() {
                 onChange={(v) => set("lineWidth", v)}
                 format={(v) => `${v.toFixed(1)} px`}
               />
-            )}
+            ) : null}
             {settings.preset === "freq-wave" ? (
               <ToggleRow
                 label="Fill the wave"
@@ -610,28 +1139,39 @@ export default function VisualizerTool() {
             />
           </ControlsCard>
 
-          <ControlsCard title="Overlays">
-            <ToggleRow
-              label="Show title"
-              checked={settings.showTitle}
-              onChange={(v) => set("showTitle", v)}
+          {/* ---------------- center art ---------------- */}
+          <ControlsCard
+            title="Center art"
+            description={
+              hasCenterArt
+                ? "The artwork in the middle of the blob / flank styles."
+                : "Used by the Blob, Flank bars and Flank lines styles — and by the “Album art (blurred)” background."
+            }
+          >
+            <ImageUploadRow
+              label="Artwork image"
+              hasImage={!!settings.centerImage}
+              onPick={(url) => set("centerImage", url)}
+              onClear={() => set("centerImage", null)}
+              hint="Album cover, logo, photo — anything"
             />
-            <div className="flex flex-col gap-2">
-              <label className="text-sm font-medium">Title text</label>
-              <Input
-                value={settings.titleText}
-                onChange={(e) => set("titleText", e.target.value)}
-                placeholder={baseName || "Track title"}
-                maxLength={80}
-                aria-label="Title text"
-                disabled={!settings.showTitle}
-              />
-            </div>
-            <ToggleRow
-              label="Show progress bar"
-              description="Thin bar at the bottom that fills with the track"
-              checked={settings.showProgress}
-              onChange={(v) => set("showProgress", v)}
+            <SliderRow
+              label="Art size"
+              value={settings.centerSize}
+              min={0.08}
+              max={0.45}
+              step={0.01}
+              onChange={(v) => set("centerSize", v)}
+              format={(v) => `${Math.round(v * 100)}%`}
+            />
+            <SliderRow
+              label="Corner roundness"
+              value={settings.centerRound}
+              min={0}
+              max={1}
+              step={0.05}
+              onChange={(v) => set("centerRound", v)}
+              format={(v) => (v < 0.05 ? "Square" : v > 0.95 ? "Circle" : `${Math.round(v * 100)}%`)}
             />
           </ControlsCard>
         </div>
@@ -640,14 +1180,44 @@ export default function VisualizerTool() {
         <div className="flex flex-col gap-6">
           <ControlsCard
             title="Live preview"
-            description="Click the canvas to seek. Every setting applies instantly."
+            description={
+              dragMode === "off"
+                ? "Click the canvas to seek. Every setting applies instantly."
+                : `Drag mode: ${
+                    dragMode === "text" ? "text" : "visualizer"
+                  } — drag anywhere on the canvas to place it.`
+            }
           >
             <div className="overflow-hidden rounded-lg border bg-black">
               <canvas
                 ref={canvasRef}
                 onClick={seek}
-                className="block w-full cursor-pointer"
-                style={{ aspectRatio: `${dims.w} / ${dims.h}` }}
+                onPointerDown={(e) => {
+                  if (dragMode === "off") return;
+                  draggingRef.current = true;
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  dragTo(e);
+                }}
+                onPointerMove={(e) => {
+                  if (draggingRef.current) dragTo(e);
+                }}
+                onPointerUp={(e) => {
+                  draggingRef.current = false;
+                  try {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  } catch {
+                    /* pointer already released */
+                  }
+                }}
+                onPointerCancel={() => {
+                  draggingRef.current = false;
+                }}
+                className="block w-full"
+                style={{
+                  aspectRatio: `${dims.w} / ${dims.h}`,
+                  touchAction: dragMode === "off" ? "auto" : "none",
+                  cursor: dragMode === "off" ? "pointer" : "grab",
+                }}
                 aria-label="Visualizer live preview"
               />
             </div>
